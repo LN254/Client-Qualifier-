@@ -1,0 +1,373 @@
+{
+  "name": "Lead Capture System (Form + WhatsApp)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "form-lead",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-webhook-form",
+      "name": "Webhook - Form Lead",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 200],
+      "webhookId": "form-lead-webhook"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-lead",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-webhook-whatsapp",
+      "name": "Webhook - WhatsApp Lead",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 380],
+      "webhookId": "whatsapp-lead-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "const source = $input.first().json;\n\n// Detect source\nconst isWhatsApp = source.waId !== undefined || source.WaId !== undefined;\n\nconst name = isWhatsApp\n  ? (source.ProfileName || source.contact?.name || 'Unknown')\n  : (source.name || source.Name || 'Unknown');\n\nconst email = isWhatsApp ? '' : (source.email || source.Email || '');\n\nconst phone = isWhatsApp\n  ? (source.waId || source.WaId || source.From || '')\n  : (source.phone || source.Phone || source.phoneNumber || '');\n\nconst message = isWhatsApp\n  ? (source.Body || source.text || source.message || '')\n  : (source.message || source.Message || source.inquiry || '');\n\nreturn [{\n  json: {\n    timestamp: new Date().toISOString(),\n    name: name.trim(),\n    email: email.trim(),\n    phone: phone.toString().trim(),\n    source: isWhatsApp ? 'WhatsApp' : 'Website Form',\n    message: message.trim(),\n    status: 'New Lead',\n    followUpSent: 'No'\n  }\n}];"
+      },
+      "id": "node-normalize",
+      "name": "Normalize Lead Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 290]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet1",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Timestamp": "={{ $json.timestamp }}",
+            "Name": "={{ $json.name }}",
+            "Email": "={{ $json.email }}",
+            "Phone": "={{ $json.phone }}",
+            "Source": "={{ $json.source }}",
+            "Message": "={{ $json.message }}",
+            "Status": "={{ $json.status }}",
+            "Follow-Up Sent": "={{ $json.followUpSent }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "node-sheets-append",
+      "name": "Save Lead to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [740, 290]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://YOUR_WATI_ENDPOINT/api/v1/sendSessionMessage/{{ $json.phone }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_WATI_API_TOKEN"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "messageText",
+              "value": "=Hey {{ $json.name }} 👋\n\nThanks for reaching out! We've received your message and our team will get back to you very shortly.\n\nWe're excited to help you out! 😊\n\n— [YOUR BUSINESS NAME]"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-autoreply",
+      "name": "Send Auto-Reply to Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [980, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR_WATI_ENDPOINT/api/v1/sendSessionMessage/YOUR_PHONE_NUMBER",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_WATI_API_TOKEN"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "messageText",
+              "value": "=🔔 *New Lead Alert!*\n\n👤 Name: {{ $json.name }}\n📧 Email: {{ $json.email }}\n📱 Phone: {{ $json.phone }}\n📥 Source: {{ $json.source }}\n💬 Message: {{ $json.message }}\n🕐 Time: {{ $json.timestamp }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-notify-owner",
+      "name": "Notify Owner via WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [980, 380]
+    },
+    {
+      "parameters": {
+        "unit": "minutes",
+        "amount": 7
+      },
+      "id": "node-wait",
+      "name": "Wait 7 Minutes",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [1220, 290]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://YOUR_WATI_ENDPOINT/api/v1/sendSessionMessage/{{ $json.phone }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_WATI_API_TOKEN"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "messageText",
+              "value": "=Hi {{ $json.name }}! 👋 Just checking in...\n\nDid you get a chance to see our message? We'd love to help you! 😊\n\n👉 What would you like to do next?\n1️⃣ Book a free call\n2️⃣ Get more info\n3️⃣ Get a quote\n\nJust reply with 1, 2, or 3 and we'll take it from there! 🚀"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-followup",
+      "name": "Send Follow-Up to Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1460, 290]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet1",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Follow-Up Sent": "Yes",
+            "Status": "Contacted"
+          }
+        },
+        "where": {
+          "values": [
+            {
+              "lookupColumn": "Phone",
+              "lookupValue": "={{ $json.phone }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-sheets-update",
+      "name": "Update Sheet - Follow-Up Sent",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1700, 290]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"success\", \"message\": \"Lead received\" }",
+        "options": {}
+      },
+      "id": "node-response-form",
+      "name": "Respond to Form Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [500, 500]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"success\", \"message\": \"WhatsApp lead received\" }",
+        "options": {}
+      },
+      "id": "node-response-whatsapp",
+      "name": "Respond to WhatsApp Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [500, 620]
+    }
+  ],
+  "connections": {
+    "Webhook - Form Lead": {
+      "main": [
+        [
+          {
+            "node": "Normalize Lead Data",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Respond to Form Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook - WhatsApp Lead": {
+      "main": [
+        [
+          {
+            "node": "Normalize Lead Data",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Respond to WhatsApp Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Lead Data": {
+      "main": [
+        [
+          {
+            "node": "Save Lead to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Lead to Google Sheets": {
+      "main": [
+        [
+          {
+            "node": "Send Auto-Reply to Lead",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify Owner via WhatsApp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Auto-Reply to Lead": {
+      "main": [
+        [
+          {
+            "node": "Wait 7 Minutes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Owner via WhatsApp": {
+      "main": [
+        [
+          {
+            "node": "Wait 7 Minutes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 7 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Send Follow-Up to Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Follow-Up to Lead": {
+      "main": [
+        [
+          {
+            "node": "Update Sheet - Follow-Up Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["lead-capture", "whatsapp", "automation"],
+  "triggerCount": 2,
+  "updatedAt": "2026-04-26T00:00:00.000Z",
+  "versionId": "1"
+}
