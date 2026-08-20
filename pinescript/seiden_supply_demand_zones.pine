@@ -178,18 +178,28 @@ if isSupplyPattern and showSupply
 
 // ------------------------- Distance to Nearest Fresh Zone ---------------------
 // Distance is measured to each zone's PROXIMAL line (the edge price reaches
-// first) since that is the line that matters for entries/alerts.
+// first) since that is the line that matters for entries/alerts. We also keep
+// the actual line price so we can tell whether the zone sits above or below
+// the current close (for the ▲/▼ arrow in the table).
 nearestDemandDist = float(na)
+nearestDemandLine = float(na)
 if array.size(demandBoxes) > 0
     for i = 0 to array.size(demandBoxes) - 1
-        d = math.abs(close - box.get_top(array.get(demandBoxes, i)))
-        nearestDemandDist := na(nearestDemandDist) ? d : math.min(nearestDemandDist, d)
+        lineVal = box.get_top(array.get(demandBoxes, i))
+        d = math.abs(close - lineVal)
+        if na(nearestDemandDist) or d < nearestDemandDist
+            nearestDemandDist := d
+            nearestDemandLine := lineVal
 
 nearestSupplyDist = float(na)
+nearestSupplyLine = float(na)
 if array.size(supplyBoxes) > 0
     for i = 0 to array.size(supplyBoxes) - 1
-        d = math.abs(close - box.get_bottom(array.get(supplyBoxes, i)))
-        nearestSupplyDist := na(nearestSupplyDist) ? d : math.min(nearestSupplyDist, d)
+        lineVal = box.get_bottom(array.get(supplyBoxes, i))
+        d = math.abs(close - lineVal)
+        if na(nearestSupplyDist) or d < nearestSupplyDist
+            nearestSupplyDist := d
+            nearestSupplyLine := lineVal
 
 var float prevDemandPips = na
 var float prevSupplyPips = na
@@ -203,15 +213,21 @@ prevDemandPips := demandPips
 prevSupplyPips := supplyPips
 
 // ------------------------------ Distance Table ---------------------------------
+// Simple readout: an arrow showing which way price must move to reach the
+// zone (▼ = zone is below price, ▲ = zone is above price) plus a rounded
+// pip count. "—" means no fresh zone of that type exists right now.
+zoneCellText(dist, line) =>
+    na(dist) ? "—" : (close > line ? "▼ " : "▲ ") + str.tostring(math.round(dist / pipSize)) + " pips"
+
 tablePos = tablePosition == "top_right" ? position.top_right : tablePosition == "top_left" ? position.top_left : tablePosition == "bottom_right" ? position.bottom_right : position.bottom_left
 var table infoTable = table.new(tablePos, 2, 3, border_width=1)
 if showDistanceTable and barstate.islast
-    table.cell(infoTable, 0, 0, "Nearest Fresh Zone", text_color=color.white, bgcolor=color.new(color.black, 40))
-    table.cell(infoTable, 1, 0, "Distance", text_color=color.white, bgcolor=color.new(color.black, 40))
+    table.cell(infoTable, 0, 0, "Fresh Zone", text_color=color.white, bgcolor=color.new(color.black, 40))
+    table.cell(infoTable, 1, 0, "Pips Away", text_color=color.white, bgcolor=color.new(color.black, 40))
     table.cell(infoTable, 0, 1, "Demand", text_color=color.white, bgcolor=color.new(color.teal, 60))
-    table.cell(infoTable, 1, 1, na(demandPips) ? "—" : str.tostring(nearestDemandDist, format.mintick) + "  (" + str.tostring(demandPips, "#.#") + " pips)", text_color=color.white, bgcolor=color.new(color.teal, 60))
+    table.cell(infoTable, 1, 1, zoneCellText(nearestDemandDist, nearestDemandLine), text_color=color.white, bgcolor=color.new(color.teal, 60))
     table.cell(infoTable, 0, 2, "Supply", text_color=color.white, bgcolor=color.new(color.red, 60))
-    table.cell(infoTable, 1, 2, na(supplyPips) ? "—" : str.tostring(nearestSupplyDist, format.mintick) + "  (" + str.tostring(supplyPips, "#.#") + " pips)", text_color=color.white, bgcolor=color.new(color.red, 60))
+    table.cell(infoTable, 1, 2, zoneCellText(nearestSupplyDist, nearestSupplyLine), text_color=color.white, bgcolor=color.new(color.red, 60))
 
 // ------------------------------ Alerts ----------------------------------------
 alertcondition(enteredDemandZone, title="Price Entered Demand Zone", message="Price has entered a fresh Demand (buy) zone on {{ticker}} at {{close}}.")
