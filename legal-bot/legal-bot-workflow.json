@@ -1,0 +1,98 @@
+{
+  "name": "Legal Bot - Kenya Jurisdiction & Advocates Act Qualifier",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "legal-inquiry",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-webhook-legal-inquiry",
+      "name": "Webhook - Legal Inquiry",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "legal-inquiry-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Kenya legal-matter classifier (inline copy of legal-bot/kenya-jurisdiction-classifier.js).\n// Keep this in sync with that file if the rules change.\n\nconst COURT_MONEY_LIMITS = {\n  smallClaimsCourtMax: 1000000,\n  residentMagistrateMax: 5000000,\n  seniorResidentMagistrateMax: 7000000,\n  principalMagistrateMax: 10000000,\n  seniorPrincipalMagistrateMax: 15000000,\n  chiefMagistrateMax: 20000000\n};\n\nconst CASE_RULES = [\n  { category: 'Employment / Labour Dispute', keywords: ['fired','dismissed','dismissal','termination','terminated','salary','wages','unpaid pay','workplace','employer','employee','redundan','wrongful dismissal','nssf','nhif','leave pay','contract of employment'], court: 'Employment and Labour Relations Court (ELRC)', basis: \"Employment and Labour Relations Court Act, 2011 (s.12) — the ELRC has exclusive original jurisdiction over employment and labour relations disputes.\" },\n  { category: 'Land / Environment Dispute', keywords: ['land','boundary','title deed','eviction','trespass','environment','pollution','lease','plot','survey','land dispute','landlord'], court: 'Environment and Land Court (ELC)', basis: \"Environment and Land Court Act, 2011 (s.13) — the ELC has exclusive original jurisdiction over land use, title, tenure, boundaries and environmental disputes.\" },\n  { category: 'Muslim Personal Law', keywords: ['kadhi','islamic marriage','muslim marriage','muslim divorce','islamic inheritance','islamic succession'], court: \"Kadhi's Court\", basis: \"Constitution Art. 170 & Kadhis' Courts Act (Cap. 11) — jurisdiction limited to Muslim personal status, marriage, divorce or inheritance where all parties profess Islam and submit to the court.\" },\n  { category: 'Family / Succession', keywords: ['divorce','custody','maintenance','succession','inheritance','probate','letters of administration','estate','marriage','adoption'], court: null, basis: 'Magistrates\\' Courts Act, 2015 (family matters) and the Law of Succession Act (Cap. 160).' },\n  { category: 'Criminal Matter', keywords: ['arrested','police','charged','criminal case','theft','stolen','assault','robbery','murder','bail','bond','cybercrime'], court: null, basis: 'Criminal Procedure Code (Cap. 75) — most matters tried in the Magistrate\\'s Court; capital/grave offences in the High Court.' },\n  { category: 'Constitutional / Judicial Review / Human Rights', keywords: ['constitutional','judicial review','human rights violation','fundamental rights','habeas corpus','unconstitutional','petition against the state'], court: 'High Court', basis: 'Constitution Art. 165(3) — the High Court has original jurisdiction to interpret the Constitution and enforce the Bill of Rights.' },\n  { category: 'General Civil / Contract / Debt Claim', keywords: ['contract','debt','breach','sue','owe me','owes me','unpaid invoice','goods','services','loan','refund','rent arrears','compensation'], court: null, basis: \"Magistrates' Courts Act, 2015 and Small Claims Court Act, 2016 — routed by claim value.\" }\n];\n\nfunction resolveCivilCourt(amount) {\n  if (amount == null) return { court: \"Small Claims Court or Magistrate's Court (class depends on claim value — amount not provided)\", note: 'Provide the claim amount to pin down the exact court class.' };\n  const L = COURT_MONEY_LIMITS;\n  if (amount <= L.smallClaimsCourtMax) return { court: 'Small Claims Court', note: `Claims up to KES ${L.smallClaimsCourtMax.toLocaleString()} — no advocate required to file, resolution targeted within 60 days.` };\n  if (amount <= L.residentMagistrateMax) return { court: \"Resident Magistrate's Court\", note: `Civil claims up to KES ${L.residentMagistrateMax.toLocaleString()}.` };\n  if (amount <= L.seniorResidentMagistrateMax) return { court: \"Senior Resident Magistrate's Court\", note: `Civil claims up to KES ${L.seniorResidentMagistrateMax.toLocaleString()}.` };\n  if (amount <= L.principalMagistrateMax) return { court: \"Principal Magistrate's Court\", note: `Civil claims up to KES ${L.principalMagistrateMax.toLocaleString()}.` };\n  if (amount <= L.seniorPrincipalMagistrateMax) return { court: \"Senior Principal Magistrate's Court\", note: `Civil claims up to KES ${L.seniorPrincipalMagistrateMax.toLocaleString()}.` };\n  if (amount <= L.chiefMagistrateMax) return { court: \"Chief Magistrate's Court\", note: `Civil claims up to KES ${L.chiefMagistrateMax.toLocaleString()}.` };\n  return { court: 'High Court', note: `High Court has unlimited pecuniary jurisdiction — applies above the Chief Magistrate's ceiling of KES ${L.chiefMagistrateMax.toLocaleString()}.` };\n}\n\nfunction resolveFamilyCourt(text, amount) {\n  if (/succession|probate|letters of administration|estate|inheritance/.test(text)) {\n    const civil = resolveCivilCourt(amount);\n    return { court: civil.court === 'High Court' ? 'High Court (Family Division)' : `${civil.court} (Succession Cause)`, note: 'Succession/probate follows the same value-based ladder as ordinary civil claims, using the estate value.' };\n  }\n  return { court: \"Magistrate's Court (Family Division)\", note: \"Divorce, custody and maintenance are normally filed at the Magistrate's Court; parties who profess Islam and submit to it may instead use the Kadhi's Court.\" };\n}\n\nfunction resolveCriminalCourt(text) {\n  const graveOffence = /murder|treason|robbery with violence|manslaughter|terrorism/.test(text);\n  return graveOffence\n    ? { court: 'High Court', note: 'Capital/grave offences are tried in the High Court.' }\n    : { court: \"Magistrate's Court\", note: \"Most criminal matters, including most bail/bond applications, start in the Magistrate's Court.\" };\n}\n\nconst ADVOCATES_ACT_TRIGGERS = [\n  { test: /\\b(qualified|licensed|licence|license|practicing certificate|practising certificate|real lawyer|verify.*advocate)\\b/i, note: \"Advocates Act (Cap. 16), ss. 9–17: only a person admitted as an advocate by the Chief Justice, enrolled on the Roll of Advocates and holding a current Practising Certificate may lawfully practise law in Kenya. Verify standing with the Law Society of Kenya (LSK).\" },\n  { test: /\\b(fee|fees|cost|charge|how much.*lawyer|legal fees)\\b/i, note: \"Advocates Act (Cap. 16), s.44 & the Advocates (Remuneration) Order: advocates' fees are governed by the Remuneration Order and can be challenged through taxation of a bill of costs.\" },\n  { test: /\\b(complain|complaint|misconduct|unethical|scammed by.*lawyer|sue my lawyer)\\b/i, note: 'Advocates Act (Cap. 16), Part IX: complaints against an advocate go to the Advocates Complaints Commission or the LSK Disciplinary Committee; serious cases go to the Advocates Disciplinary Tribunal.' },\n  { test: /\\bunqualified person|non-advocate|not a lawyer.*representing\\b/i, note: \"Advocates Act (Cap. 16), s.34: it is an offence for an unqualified person to act as, or pretend to be, an advocate, or to prepare legal documents for a fee without being one.\" }\n];\n\nfunction classify(rawText, claimAmount) {\n  const text = (rawText || '').toLowerCase();\n  const amount = claimAmount == null || claimAmount === '' ? null : Number(claimAmount);\n\n  let match = null;\n  for (const rule of CASE_RULES) {\n    if (rule.keywords.some((kw) => text.includes(kw))) { match = rule; break; }\n  }\n\n  let court, basis, note = null;\n  if (!match) {\n    court = 'Unclear — needs human triage';\n    basis = 'No case-type keywords matched. An advocate should review the raw inquiry before routing.';\n  } else if (match.category === 'General Civil / Contract / Debt Claim') {\n    const resolved = resolveCivilCourt(amount);\n    court = resolved.court; note = resolved.note; basis = match.basis;\n  } else if (match.category === 'Family / Succession') {\n    const resolved = resolveFamilyCourt(text, amount);\n    court = resolved.court; note = resolved.note; basis = match.basis;\n  } else if (match.category === 'Criminal Matter') {\n    const resolved = resolveCriminalCourt(text);\n    court = resolved.court; note = resolved.note; basis = match.basis;\n  } else {\n    court = match.court; basis = match.basis;\n  }\n\n  const advocatesActNotes = ADVOCATES_ACT_TRIGGERS.filter((t) => t.test.test(text)).map((t) => t.note);\n\n  return {\n    caseCategory: match ? match.category : 'Unclassified',\n    recommendedCourt: court,\n    jurisdictionBasis: basis,\n    courtNote: note,\n    advocatesActNotes,\n    disclaimer: 'Automated triage only — not legal advice. Confirm with a qualified advocate before filing.'\n  };\n}\n\nconst source = $input.first().json;\nconst message = (source.message || source.text || source.Body || source.inquiry || '').toString();\nconst amount = source.amount || source.claimAmount || source.value || null;\nconst name = (source.name || source.Name || source.ProfileName || 'Unknown').toString().trim();\nconst phone = (source.phone || source.Phone || source.waId || source.WaId || source.From || '').toString().trim();\n\nconst result = classify(message, amount);\n\nreturn [{\n  json: {\n    timestamp: new Date().toISOString(),\n    name,\n    phone,\n    inquiry: message.trim(),\n    claimAmount: amount,\n    ...result\n  }\n}];"
+      },
+      "id": "node-classify-legal-matter",
+      "name": "Classify Kenya Legal Matter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\n\nlet lines = [];\nlines.push(`Thanks${r.name && r.name !== 'Unknown' ? ' ' + r.name : ''}, here's an initial read on your matter:`);\nlines.push(`\\nCase type: ${r.caseCategory}`);\nlines.push(`Likely court: ${r.recommendedCourt}`);\nlines.push(`Why: ${r.jurisdictionBasis}`);\nif (r.courtNote) lines.push(r.courtNote);\nif (r.advocatesActNotes && r.advocatesActNotes.length) {\n  lines.push('\\nAdvocates Act notes:');\n  r.advocatesActNotes.forEach((n) => lines.push(`- ${n}`));\n}\nlines.push(`\\n${r.disclaimer}`);\nlines.push('An advocate from our team will follow up to confirm next steps.');\n\nreturn [{ json: { ...r, replyMessage: lines.join('\\n') } }];"
+      },
+      "id": "node-format-reply",
+      "name": "Format Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [740, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "id": "node-response-legal",
+      "name": "Respond with Classification",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [980, 300]
+    }
+  ],
+  "connections": {
+    "Webhook - Legal Inquiry": {
+      "main": [
+        [
+          {
+            "node": "Classify Kenya Legal Matter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Kenya Legal Matter": {
+      "main": [
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Reply": {
+      "main": [
+        [
+          {
+            "node": "Respond with Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["legal-bot", "kenya", "jurisdiction", "advocates-act"],
+  "triggerCount": 1,
+  "updatedAt": "2026-08-20T00:00:00.000Z",
+  "versionId": "1"
+}
