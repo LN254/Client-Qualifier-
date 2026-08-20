@@ -1,0 +1,179 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © Auto Lead Qualifier project
+//@version=5
+indicator("Supply & Demand Zones (Sam Seiden Method)", shorttitle="S&D Zones (Seiden)", overlay=true, max_boxes_count=500, max_labels_count=500)
+
+// =============================================================================
+// SUPPLY & DEMAND ZONES — based on the methodology described in Sam Seiden's
+// "Supply Demand Trading" (Online Trading Academy).
+//
+// Core idea: markets move in three phases — a LEG-IN, a BASE (consolidation
+// where large orders are placed), and a LEG-OUT (the impulsive move that
+// leaves the base). The base is where supply or demand becomes "imbalanced".
+//
+//   Leg-in UP  + Leg-out UP    = Rally-Base-Rally (RBR)  -> Demand (support)
+//   Leg-in DOWN+ Leg-out UP    = Drop-Base-Rally  (DBR)  -> Demand (support)
+//   Leg-in UP  + Leg-out DOWN  = Rally-Base-Drop  (RBD)  -> Supply (resistance)
+//   Leg-in DOWN+ Leg-out DOWN  = Drop-Base-Drop   (DBD)  -> Supply (resistance)
+//
+// A zone is considered "fresh" (highest probability) until price returns and
+// trades back into it — at that point it is "tested" and loses much of its
+// edge, per Seiden's rules of profitable and non-profitable zones.
+// =============================================================================
+
+// ------------------------------- Inputs -------------------------------------
+grpBase = "Base Detection"
+baseAtrLen      = input.int(14, "ATR Length", minval=1, group=grpBase)
+baseRangeFactor = input.float(0.5, "Basing Candle Max Range (x ATR)", minval=0.05, step=0.05, group=grpBase, tooltip="A candle is considered part of a base if its high-low range is <= this multiple of ATR.")
+baseMaxBars     = input.int(6, "Max Candles in a Base", minval=1, maxval=20, group=grpBase, tooltip="Seiden favors tight, fast bases (typically 1-6 candles).")
+
+grpBreak = "Leg-Out (Breakout) Detection"
+legAtrFactor    = input.float(1.0, "Min Leg-Out Range (x ATR)", minval=0.1, step=0.1, group=grpBreak, tooltip="The candle leaving the base must have a range at least this multiple of ATR to count as a strong, imbalanced move.")
+
+grpZones = "Zone Display"
+showDemand      = input.bool(true, "Show Demand Zones", group=grpZones)
+showSupply      = input.bool(true, "Show Supply Zones", group=grpZones)
+useBodyProximal = input.bool(true, "Use Candle Body for Proximal Line", group=grpZones, tooltip="Proximal (near) line uses the base candles' open/close extreme; distal (far) line uses the wick extreme. This is the classic Seiden zone shape used for stop placement.")
+zoneExtendBars  = input.int(300, "Extend Fresh Zones Right (bars)", minval=10, group=grpZones)
+maxZonesEach    = input.int(6, "Max Fresh Zones to Keep (each side)", minval=1, maxval=30, group=grpZones)
+hideTested      = input.bool(false, "Hide Zones Once Tested", group=grpZones)
+showLabels      = input.bool(true, "Show Zone Labels", group=grpZones)
+
+grpColors = "Colors"
+demandColor      = input.color(color.new(color.teal, 75), "Demand (Fresh)", group=grpColors)
+demandBorder     = input.color(color.new(color.teal, 20), "Demand Border", group=grpColors)
+supplyColor      = input.color(color.new(color.red, 75), "Supply (Fresh)", group=grpColors)
+supplyBorder     = input.color(color.new(color.red, 20), "Supply Border", group=grpColors)
+testedColor      = input.color(color.new(color.gray, 85), "Tested Zone Fill", group=grpColors)
+testedBorder     = input.color(color.new(color.gray, 50), "Tested Zone Border", group=grpColors)
+
+// ------------------------------ Core Series ----------------------------------
+atrVal = ta.atr(baseAtrLen)
+rng    = high - low
+isBasingCandle = rng <= baseRangeFactor * atrVal
+
+// Count consecutive basing candles ending at bar[1] (i.e. immediately before
+// the current, possibly-breakout, candle).
+var int baseCount = 0
+baseCount := 0
+for i = 1 to baseMaxBars
+    if isBasingCandle[i]
+        baseCount += 1
+    else
+        break
+
+isStrongLegOut = rng >= legAtrFactor * atrVal and not isBasingCandle
+legOutBullish  = close > open
+legOutBearish  = close < open
+
+haveBase = baseCount >= 1 and baseCount < bar_index
+
+// Leg-in candle sits immediately before the base (offset baseCount+1).
+legInIdx = baseCount + 1
+legInBullish = haveBase ? close[legInIdx] > open[legInIdx] : false
+legInBearish = haveBase ? close[legInIdx] < open[legInIdx] : false
+
+isDemandPattern = haveBase and isStrongLegOut and legOutBullish and (legInBullish or legInBearish)
+isSupplyPattern = haveBase and isStrongLegOut and legOutBearish and (legInBullish or legInBearish)
+
+// ------------------------------ Zone Storage ----------------------------------
+var box[]   demandBoxes = array.new_box()
+var box[]   supplyBoxes = array.new_box()
+var label[] demandLabels = array.new_label()
+var label[] supplyLabels = array.new_label()
+
+var bool enteredDemandZone = false
+var bool enteredSupplyZone = false
+enteredDemandZone := false
+enteredSupplyZone := false
+
+// ---------------------- Mitigation check (runs BEFORE new zones are added) ----
+checkMitigation(boxArr, labelArr) =>
+    bool touched = false
+    if array.size(boxArr) > 0
+        for i = array.size(boxArr) - 1 to 0
+            b = array.get(boxArr, i)
+            top = box.get_top(b)
+            bottom = box.get_bottom(b)
+            bool overlap = low <= top and high >= bottom
+            if overlap
+                touched := true
+                box.set_right(b, bar_index)
+                box.set_bgcolor(b, testedColor)
+                box.set_border_color(b, testedBorder)
+                lbl = array.get(labelArr, i)
+                if hideTested
+                    box.delete(b)
+                    if not na(lbl)
+                        label.delete(lbl)
+                    array.remove(boxArr, i)
+                    array.remove(labelArr, i)
+                else
+                    array.remove(boxArr, i)
+                    array.remove(labelArr, i)
+    touched
+
+enteredDemandZone := checkMitigation(demandBoxes, demandLabels)
+enteredSupplyZone := checkMitigation(supplyBoxes, supplyLabels)
+
+// Extend still-active (fresh) zones further to the right each bar.
+extendActive(boxArr) =>
+    if array.size(boxArr) > 0
+        for i = 0 to array.size(boxArr) - 1
+            box.set_right(array.get(boxArr, i), bar_index + zoneExtendBars)
+extendActive(demandBoxes)
+extendActive(supplyBoxes)
+
+// ------------------------------ Zone Creation ----------------------------------
+baseLeftIdx = bar_index - baseCount
+
+if isDemandPattern and showDemand
+    baseHighestLow  = ta.highest(low, baseCount)[1]
+    baseLowestLow   = ta.lowest(low, baseCount)[1]
+    baseHighestBody = ta.highest(math.max(open, close), baseCount)[1]
+    top    = useBodyProximal ? baseHighestBody : baseHighestLow
+    bottom = baseLowestLow
+    if top > bottom
+        newBox = box.new(left=baseLeftIdx, top=top, right=bar_index + zoneExtendBars, bottom=bottom, border_color=demandBorder, bgcolor=demandColor, extend=extend.none)
+        array.push(demandBoxes, newBox)
+        if showLabels
+            lbl = label.new(baseLeftIdx, bottom, "Demand\n(" + str.tostring(baseCount) + " candle base)", style=label.style_label_up, color=color.new(color.teal, 100), textcolor=color.teal, size=size.small)
+            array.push(demandLabels, lbl)
+        else
+            array.push(demandLabels, na)
+        if array.size(demandBoxes) > maxZonesEach
+            oldBox = array.shift(demandBoxes)
+            box.delete(oldBox)
+            oldLbl = array.shift(demandLabels)
+            if not na(oldLbl)
+                label.delete(oldLbl)
+
+if isSupplyPattern and showSupply
+    baseHighestHigh = ta.highest(high, baseCount)[1]
+    baseLowestHigh  = ta.lowest(high, baseCount)[1]
+    baseLowestBody  = ta.lowest(math.min(open, close), baseCount)[1]
+    top    = baseHighestHigh
+    bottom = useBodyProximal ? baseLowestBody : baseLowestHigh
+    if top > bottom
+        newBox = box.new(left=baseLeftIdx, top=top, right=bar_index + zoneExtendBars, bottom=bottom, border_color=supplyBorder, bgcolor=supplyColor, extend=extend.none)
+        array.push(supplyBoxes, newBox)
+        if showLabels
+            lbl = label.new(baseLeftIdx, top, "Supply\n(" + str.tostring(baseCount) + " candle base)", style=label.style_label_down, color=color.new(color.red, 100), textcolor=color.red, size=size.small)
+            array.push(supplyLabels, lbl)
+        else
+            array.push(supplyLabels, na)
+        if array.size(supplyBoxes) > maxZonesEach
+            oldBox = array.shift(supplyBoxes)
+            box.delete(oldBox)
+            oldLbl = array.shift(supplyLabels)
+            if not na(oldLbl)
+                label.delete(oldLbl)
+
+// ------------------------------ Alerts ----------------------------------------
+alertcondition(enteredDemandZone, title="Price Entered Demand Zone", message="Price has entered a fresh Demand (buy) zone on {{ticker}} at {{close}}.")
+alertcondition(enteredSupplyZone, title="Price Entered Supply Zone", message="Price has entered a fresh Supply (sell) zone on {{ticker}} at {{close}}.")
+
+if enteredDemandZone
+    alert("Demand zone tested on " + syminfo.ticker + " at " + str.tostring(close), alert.freq_once_per_bar)
+if enteredSupplyZone
+    alert("Supply zone tested on " + syminfo.ticker + " at " + str.tostring(close), alert.freq_once_per_bar)
