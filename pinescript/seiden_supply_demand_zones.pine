@@ -213,21 +213,28 @@ prevDemandPips := demandPips
 prevSupplyPips := supplyPips
 
 // ------------------------------ Distance Table ---------------------------------
-// Simple readout: an arrow showing which way price must move to reach the
-// zone (▼ = zone is below price, ▲ = zone is above price) plus a rounded
-// pip count. "—" means no fresh zone of that type exists right now.
-zoneCellText(dist, line) =>
+// Simple readout: the actual price level of the nearest fresh zone, plus an
+// arrow showing which way price must move to reach it (▼ = zone is below
+// price, ▲ = zone is above price) and a rounded pip count. "—" means no
+// fresh zone of that type exists right now.
+zonePriceText(line) =>
+    na(line) ? "—" : str.tostring(line, format.mintick)
+
+zonePipsText(dist, line) =>
     na(dist) ? "—" : (close > line ? "▼ " : "▲ ") + str.tostring(math.round(dist / pipSize)) + " pips"
 
 tablePos = tablePosition == "top_right" ? position.top_right : tablePosition == "top_left" ? position.top_left : tablePosition == "bottom_right" ? position.bottom_right : position.bottom_left
-var table infoTable = table.new(tablePos, 2, 3, border_width=1)
+var table infoTable = table.new(tablePos, 3, 3, border_width=1)
 if showDistanceTable and barstate.islast
     table.cell(infoTable, 0, 0, "Fresh Zone", text_color=color.white, bgcolor=color.new(color.black, 40))
-    table.cell(infoTable, 1, 0, "Pips Away", text_color=color.white, bgcolor=color.new(color.black, 40))
+    table.cell(infoTable, 1, 0, "Price", text_color=color.white, bgcolor=color.new(color.black, 40))
+    table.cell(infoTable, 2, 0, "Pips Away", text_color=color.white, bgcolor=color.new(color.black, 40))
     table.cell(infoTable, 0, 1, "Demand", text_color=color.white, bgcolor=color.new(color.teal, 60))
-    table.cell(infoTable, 1, 1, zoneCellText(nearestDemandDist, nearestDemandLine), text_color=color.white, bgcolor=color.new(color.teal, 60))
+    table.cell(infoTable, 1, 1, zonePriceText(nearestDemandLine), text_color=color.white, bgcolor=color.new(color.teal, 60))
+    table.cell(infoTable, 2, 1, zonePipsText(nearestDemandDist, nearestDemandLine), text_color=color.white, bgcolor=color.new(color.teal, 60))
     table.cell(infoTable, 0, 2, "Supply", text_color=color.white, bgcolor=color.new(color.red, 60))
-    table.cell(infoTable, 1, 2, zoneCellText(nearestSupplyDist, nearestSupplyLine), text_color=color.white, bgcolor=color.new(color.red, 60))
+    table.cell(infoTable, 1, 2, zonePriceText(nearestSupplyLine), text_color=color.white, bgcolor=color.new(color.red, 60))
+    table.cell(infoTable, 2, 2, zonePipsText(nearestSupplyDist, nearestSupplyLine), text_color=color.white, bgcolor=color.new(color.red, 60))
 
 // ------------------------------ Alerts ----------------------------------------
 alertcondition(enteredDemandZone, title="Price Entered Demand Zone", message="Price has entered a fresh Demand (buy) zone on {{ticker}} at {{close}}.")
