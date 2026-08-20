@@ -39,6 +39,13 @@ maxZonesEach    = input.int(6, "Max Fresh Zones to Keep (each side)", minval=1, 
 hideTested      = input.bool(false, "Hide Zones Once Tested", group=grpZones)
 showLabels      = input.bool(true, "Show Zone Labels", group=grpZones)
 
+grpInfo = "Distance / Proximity Alerts"
+showDistanceTable  = input.bool(true, "Show Nearest Zone Distance Table", group=grpInfo)
+tablePosition      = input.string("top_right", "Table Position", options=["top_right", "top_left", "bottom_right", "bottom_left"], group=grpInfo)
+pipSize            = input.float(0.0001, "Pip Size", minval=0.00000001, step=0.0001, group=grpInfo, tooltip="0.0001 for most FX pairs, 0.01 for JPY pairs, 1 for indices/stocks (then reads as points).")
+enableProximityAlert = input.bool(true, "Enable 'Approaching Fresh Zone' Alert", group=grpInfo)
+proximityPips         = input.float(20, "Proximity Alert Distance (pips)", minval=1, group=grpInfo, tooltip="Fires once when price closes within this many pips of the nearest fresh zone's proximal line, approaching from outside that distance.")
+
 grpColors = "Colors"
 demandColor      = input.color(color.new(color.teal, 75), "Demand (Fresh)", group=grpColors)
 demandBorder     = input.color(color.new(color.teal, 20), "Demand Border", group=grpColors)
@@ -169,11 +176,54 @@ if isSupplyPattern and showSupply
             if not na(oldLbl)
                 label.delete(oldLbl)
 
+// ------------------------- Distance to Nearest Fresh Zone ---------------------
+// Distance is measured to each zone's PROXIMAL line (the edge price reaches
+// first) since that is the line that matters for entries/alerts.
+nearestDemandDist = float(na)
+if array.size(demandBoxes) > 0
+    for i = 0 to array.size(demandBoxes) - 1
+        d = math.abs(close - box.get_top(array.get(demandBoxes, i)))
+        nearestDemandDist := na(nearestDemandDist) ? d : math.min(nearestDemandDist, d)
+
+nearestSupplyDist = float(na)
+if array.size(supplyBoxes) > 0
+    for i = 0 to array.size(supplyBoxes) - 1
+        d = math.abs(close - box.get_bottom(array.get(supplyBoxes, i)))
+        nearestSupplyDist := na(nearestSupplyDist) ? d : math.min(nearestSupplyDist, d)
+
+var float prevDemandPips = na
+var float prevSupplyPips = na
+demandPips = na(nearestDemandDist) ? na : nearestDemandDist / pipSize
+supplyPips = na(nearestSupplyDist) ? na : nearestSupplyDist / pipSize
+
+approachingDemand = enableProximityAlert and not na(demandPips) and not na(prevDemandPips) and demandPips <= proximityPips and prevDemandPips > proximityPips
+approachingSupply = enableProximityAlert and not na(supplyPips) and not na(prevSupplyPips) and supplyPips <= proximityPips and prevSupplyPips > proximityPips
+
+prevDemandPips := demandPips
+prevSupplyPips := supplyPips
+
+// ------------------------------ Distance Table ---------------------------------
+tablePos = tablePosition == "top_right" ? position.top_right : tablePosition == "top_left" ? position.top_left : tablePosition == "bottom_right" ? position.bottom_right : position.bottom_left
+var table infoTable = table.new(tablePos, 2, 3, border_width=1)
+if showDistanceTable and barstate.islast
+    table.cell(infoTable, 0, 0, "Nearest Fresh Zone", text_color=color.white, bgcolor=color.new(color.black, 40))
+    table.cell(infoTable, 1, 0, "Distance", text_color=color.white, bgcolor=color.new(color.black, 40))
+    table.cell(infoTable, 0, 1, "Demand", text_color=color.white, bgcolor=color.new(color.teal, 60))
+    table.cell(infoTable, 1, 1, na(demandPips) ? "—" : str.tostring(nearestDemandDist, format.mintick) + "  (" + str.tostring(demandPips, "#.#") + " pips)", text_color=color.white, bgcolor=color.new(color.teal, 60))
+    table.cell(infoTable, 0, 2, "Supply", text_color=color.white, bgcolor=color.new(color.red, 60))
+    table.cell(infoTable, 1, 2, na(supplyPips) ? "—" : str.tostring(nearestSupplyDist, format.mintick) + "  (" + str.tostring(supplyPips, "#.#") + " pips)", text_color=color.white, bgcolor=color.new(color.red, 60))
+
 // ------------------------------ Alerts ----------------------------------------
 alertcondition(enteredDemandZone, title="Price Entered Demand Zone", message="Price has entered a fresh Demand (buy) zone on {{ticker}} at {{close}}.")
 alertcondition(enteredSupplyZone, title="Price Entered Supply Zone", message="Price has entered a fresh Supply (sell) zone on {{ticker}} at {{close}}.")
+alertcondition(approachingDemand, title="Price Approaching Demand Zone", message="Price is within the proximity threshold of a fresh Demand zone on {{ticker}} at {{close}}.")
+alertcondition(approachingSupply, title="Price Approaching Supply Zone", message="Price is within the proximity threshold of a fresh Supply zone on {{ticker}} at {{close}}.")
 
 if enteredDemandZone
     alert("Demand zone tested on " + syminfo.ticker + " at " + str.tostring(close), alert.freq_once_per_bar)
 if enteredSupplyZone
     alert("Supply zone tested on " + syminfo.ticker + " at " + str.tostring(close), alert.freq_once_per_bar)
+if approachingDemand
+    alert("Price approaching fresh Demand zone on " + syminfo.ticker + " (" + str.tostring(demandPips, "#.#") + " pips away)", alert.freq_once_per_bar)
+if approachingSupply
+    alert("Price approaching fresh Supply zone on " + syminfo.ticker + " (" + str.tostring(supplyPips, "#.#") + " pips away)", alert.freq_once_per_bar)
