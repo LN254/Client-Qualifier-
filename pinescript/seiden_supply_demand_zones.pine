@@ -45,6 +45,7 @@ tablePosition      = input.string("top_right", "Table Position", options=["top_r
 pipSize            = input.float(0.0001, "Pip Size", minval=0.00000001, step=0.0001, group=grpInfo, tooltip="0.0001 for most FX pairs, 0.01 for JPY pairs, 1 for indices/stocks (then reads as points).")
 enableProximityAlert = input.bool(true, "Enable 'Approaching Fresh Zone' Alert", group=grpInfo)
 proximityPips         = input.float(20, "Proximity Alert Distance (pips)", minval=1, group=grpInfo, tooltip="Fires once when price closes within this many pips of the nearest fresh zone's proximal line, approaching from outside that distance.")
+showNearestZoneLines  = input.bool(true, "Draw Lines at Nearest Fresh Zone Levels", group=grpInfo, tooltip="Draws a dashed ray at the nearest fresh demand/supply price shown in the table, even if the zone's box itself is off-screen.")
 
 grpColors = "Colors"
 demandColor      = input.color(color.new(color.teal, 75), "Demand (Fresh)", group=grpColors)
@@ -235,6 +236,48 @@ if showDistanceTable and barstate.islast
     table.cell(infoTable, 0, 2, "Supply", text_color=color.white, bgcolor=color.new(color.red, 60))
     table.cell(infoTable, 1, 2, zonePriceText(nearestSupplyLine), text_color=color.white, bgcolor=color.new(color.red, 60))
     table.cell(infoTable, 2, 2, zonePipsText(nearestSupplyDist, nearestSupplyLine), text_color=color.white, bgcolor=color.new(color.red, 60))
+
+// -------------------- Lines at Nearest Fresh Zone Levels -----------------------
+// A dashed ray + price label at each nearest fresh zone's level, matching the
+// table above. This keeps the level visible even when the zone's box itself
+// is scrolled off the visible price range (as with far-away, still-fresh zones).
+var line  nearestDemandLineObj  = na
+var label nearestDemandLabelObj = na
+var line  nearestSupplyLineObj  = na
+var label nearestSupplyLabelObj = na
+
+if showNearestZoneLines and barstate.islast
+    if not na(nearestDemandLine)
+        if na(nearestDemandLineObj)
+            nearestDemandLineObj := line.new(bar_index - 1, nearestDemandLine, bar_index, nearestDemandLine, extend=extend.right, color=demandBorder, width=2, style=line.style_dashed)
+            nearestDemandLabelObj := label.new(bar_index, nearestDemandLine, "Demand " + str.tostring(nearestDemandLine, format.mintick), style=label.style_label_left, color=color.new(color.teal, 0), textcolor=color.white, size=size.small)
+        else
+            line.set_xy1(nearestDemandLineObj, bar_index - 1, nearestDemandLine)
+            line.set_xy2(nearestDemandLineObj, bar_index, nearestDemandLine)
+            label.set_xy(nearestDemandLabelObj, bar_index, nearestDemandLine)
+            label.set_text(nearestDemandLabelObj, "Demand " + str.tostring(nearestDemandLine, format.mintick))
+    else
+        if not na(nearestDemandLineObj)
+            line.delete(nearestDemandLineObj)
+            label.delete(nearestDemandLabelObj)
+            nearestDemandLineObj := na
+            nearestDemandLabelObj := na
+
+    if not na(nearestSupplyLine)
+        if na(nearestSupplyLineObj)
+            nearestSupplyLineObj := line.new(bar_index - 1, nearestSupplyLine, bar_index, nearestSupplyLine, extend=extend.right, color=supplyBorder, width=2, style=line.style_dashed)
+            nearestSupplyLabelObj := label.new(bar_index, nearestSupplyLine, "Supply " + str.tostring(nearestSupplyLine, format.mintick), style=label.style_label_left, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+        else
+            line.set_xy1(nearestSupplyLineObj, bar_index - 1, nearestSupplyLine)
+            line.set_xy2(nearestSupplyLineObj, bar_index, nearestSupplyLine)
+            label.set_xy(nearestSupplyLabelObj, bar_index, nearestSupplyLine)
+            label.set_text(nearestSupplyLabelObj, "Supply " + str.tostring(nearestSupplyLine, format.mintick))
+    else
+        if not na(nearestSupplyLineObj)
+            line.delete(nearestSupplyLineObj)
+            label.delete(nearestSupplyLabelObj)
+            nearestSupplyLineObj := na
+            nearestSupplyLabelObj := na
 
 // ------------------------------ Alerts ----------------------------------------
 alertcondition(enteredDemandZone, title="Price Entered Demand Zone", message="Price has entered a fresh Demand (buy) zone on {{ticker}} at {{close}}.")
