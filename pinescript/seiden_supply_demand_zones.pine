@@ -38,11 +38,13 @@ zoneExtendBars  = input.int(300, "Extend Fresh Zones Right (bars)", minval=10, g
 maxZonesEach    = input.int(6, "Max Fresh Zones to Keep (each side)", minval=1, maxval=30, group=grpZones)
 hideTested      = input.bool(true, "Hide Zones Once Tested", group=grpZones)
 showLabels      = input.bool(true, "Show Zone Labels", group=grpZones)
+maxZoneAgeBars  = input.int(500, "Max Zone Age (bars, 0 = no limit)", minval=0, group=grpZones, tooltip="A zone stops counting as 'fresh' once it's older than this many bars, even if price never tested it. Prevents decades-old untested zones (e.g. historic crash levels) from cluttering the chart and table. ~500 on a daily chart is roughly 2 years.")
 
 grpInfo = "Distance / Proximity Alerts"
 showDistanceTable  = input.bool(true, "Show Nearest Zone Distance Table", group=grpInfo)
 tablePosition      = input.string("top_right", "Table Position", options=["top_right", "top_left", "bottom_right", "bottom_left"], group=grpInfo)
 pipSize            = input.float(0.0001, "Pip Size", minval=0.00000001, step=0.0001, group=grpInfo, tooltip="0.0001 for most FX pairs, 0.01 for JPY pairs, 1 for indices/stocks (then reads as points).")
+maxRelevantPips    = input.float(150, "Max Relevant Distance (pips, 0 = no limit)", minval=0, group=grpInfo, tooltip="Hides a zone from the table/lines/alerts if it's farther than this many pips away, without deleting it from the chart. Keeps the table focused on levels price could realistically reach soon.")
 enableProximityAlert = input.bool(true, "Enable 'Approaching Fresh Zone' Alert", group=grpInfo)
 proximityPips         = input.float(20, "Proximity Alert Distance (pips)", minval=1, group=grpInfo, tooltip="Fires once when price closes within this many pips of the nearest fresh zone's proximal line, approaching from outside that distance.")
 showNearestZoneLines  = input.bool(true, "Draw Lines at Nearest Fresh Zone Levels", group=grpInfo, tooltip="Draws a dashed ray at the nearest fresh demand/supply price shown in the table, even if the zone's box itself is off-screen.")
@@ -89,6 +91,8 @@ var box[]   demandBoxes = array.new_box()
 var box[]   supplyBoxes = array.new_box()
 var label[] demandLabels = array.new_label()
 var label[] supplyLabels = array.new_label()
+var int[]   demandCreatedBar = array.new_int()
+var int[]   supplyCreatedBar = array.new_int()
 
 var bool enteredDemandZone = false
 var bool enteredSupplyZone = false
@@ -96,7 +100,7 @@ enteredDemandZone := false
 enteredSupplyZone := false
 
 // ---------------------- Mitigation check (runs BEFORE new zones are added) ----
-checkMitigation(boxArr, labelArr) =>
+checkMitigation(boxArr, labelArr, createdArr) =>
     bool touched = false
     if array.size(boxArr) > 0
         for i = array.size(boxArr) - 1 to 0
@@ -116,13 +120,36 @@ checkMitigation(boxArr, labelArr) =>
                         label.delete(lbl)
                     array.remove(boxArr, i)
                     array.remove(labelArr, i)
+                    array.remove(createdArr, i)
                 else
                     array.remove(boxArr, i)
                     array.remove(labelArr, i)
+                    array.remove(createdArr, i)
     touched
 
-enteredDemandZone := checkMitigation(demandBoxes, demandLabels)
-enteredSupplyZone := checkMitigation(supplyBoxes, supplyLabels)
+enteredDemandZone := checkMitigation(demandBoxes, demandLabels, demandCreatedBar)
+enteredSupplyZone := checkMitigation(supplyBoxes, supplyLabels, supplyCreatedBar)
+
+// ------------------- Expiry check (drops zones older than Max Zone Age) -------
+// A zone that's technically still untested but decades old (e.g. a historic
+// crash level) is no longer practically relevant, so it's dropped from
+// tracking entirely once it exceeds Max Zone Age, regardless of hideTested.
+checkExpiry(boxArr, labelArr, createdArr) =>
+    if maxZoneAgeBars > 0 and array.size(boxArr) > 0
+        for i = array.size(boxArr) - 1 to 0
+            createdBar = array.get(createdArr, i)
+            if bar_index - createdBar > maxZoneAgeBars
+                b = array.get(boxArr, i)
+                lbl = array.get(labelArr, i)
+                box.delete(b)
+                if not na(lbl)
+                    label.delete(lbl)
+                array.remove(boxArr, i)
+                array.remove(labelArr, i)
+                array.remove(createdArr, i)
+
+checkExpiry(demandBoxes, demandLabels, demandCreatedBar)
+checkExpiry(supplyBoxes, supplyLabels, supplyCreatedBar)
 
 // Extend still-active (fresh) zones further to the right each bar.
 extendActive(boxArr) =>
@@ -144,6 +171,7 @@ if isDemandPattern and showDemand
     if top > bottom
         newBox = box.new(left=baseLeftIdx, top=top, right=bar_index + zoneExtendBars, bottom=bottom, border_color=demandBorder, bgcolor=demandColor, extend=extend.none)
         array.push(demandBoxes, newBox)
+        array.push(demandCreatedBar, bar_index)
         if showLabels
             lbl = label.new(baseLeftIdx, bottom, "Demand\n(" + str.tostring(baseCount) + " candle base)", style=label.style_label_up, color=color.new(color.teal, 100), textcolor=color.teal, size=size.small)
             array.push(demandLabels, lbl)
@@ -155,6 +183,7 @@ if isDemandPattern and showDemand
             oldLbl = array.shift(demandLabels)
             if not na(oldLbl)
                 label.delete(oldLbl)
+            array.shift(demandCreatedBar)
 
 if isSupplyPattern and showSupply
     baseHighestHigh = ta.highest(high, baseCount)[1]
@@ -165,6 +194,7 @@ if isSupplyPattern and showSupply
     if top > bottom
         newBox = box.new(left=baseLeftIdx, top=top, right=bar_index + zoneExtendBars, bottom=bottom, border_color=supplyBorder, bgcolor=supplyColor, extend=extend.none)
         array.push(supplyBoxes, newBox)
+        array.push(supplyCreatedBar, bar_index)
         if showLabels
             lbl = label.new(baseLeftIdx, top, "Supply\n(" + str.tostring(baseCount) + " candle base)", style=label.style_label_down, color=color.new(color.red, 100), textcolor=color.red, size=size.small)
             array.push(supplyLabels, lbl)
@@ -176,6 +206,7 @@ if isSupplyPattern and showSupply
             oldLbl = array.shift(supplyLabels)
             if not na(oldLbl)
                 label.delete(oldLbl)
+            array.shift(supplyCreatedBar)
 
 // ------------------------- Distance to Nearest Fresh Zone ---------------------
 // Distance is measured to each zone's PROXIMAL line (the edge price reaches
@@ -201,6 +232,16 @@ if array.size(supplyBoxes) > 0
         if na(nearestSupplyDist) or d < nearestSupplyDist
             nearestSupplyDist := d
             nearestSupplyLine := lineVal
+
+// Filter out zones that are technically nearest but too far away to be
+// practically relevant (e.g. decades-old levels thousands of pips away).
+// The zone stays on the chart — this only affects the table/lines/alerts.
+if maxRelevantPips > 0 and not na(nearestDemandDist) and (nearestDemandDist / pipSize) > maxRelevantPips
+    nearestDemandDist := na
+    nearestDemandLine := na
+if maxRelevantPips > 0 and not na(nearestSupplyDist) and (nearestSupplyDist / pipSize) > maxRelevantPips
+    nearestSupplyDist := na
+    nearestSupplyLine := na
 
 var float prevDemandPips = na
 var float prevSupplyPips = na
