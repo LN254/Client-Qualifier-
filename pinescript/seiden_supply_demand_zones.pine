@@ -36,7 +36,7 @@ showSupply      = input.bool(true, "Show Supply Zones", group=grpZones)
 useBodyProximal = input.bool(true, "Use Candle Body for Proximal Line", group=grpZones, tooltip="Proximal (near) line uses the base candles' open/close extreme; distal (far) line uses the wick extreme. This is the classic Seiden zone shape used for stop placement.")
 zoneExtendBars  = input.int(300, "Extend Fresh Zones Right (bars)", minval=10, group=grpZones)
 maxZonesEach    = input.int(6, "Max Fresh Zones to Keep (each side)", minval=1, maxval=30, group=grpZones)
-hideTested      = input.bool(false, "Hide Zones Once Tested", group=grpZones)
+hideTested      = input.bool(true, "Hide Zones Once Tested", group=grpZones)
 showLabels      = input.bool(true, "Show Zone Labels", group=grpZones)
 
 grpInfo = "Distance / Proximity Alerts"
