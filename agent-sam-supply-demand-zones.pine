@@ -1,0 +1,270 @@
+//@version=6
+// Agent Sam — Seiden Supply & Demand Zone Analyst
+// Heuristic base/departure zone detector with quality scoring, freshness
+// tracking and higher-timeframe confluence. See spec: base 1-5 tight candles
+// immediately before an impulsive departure leg, classified as
+// DBR/RBR (demand) or RBD/DBD (supply).
+indicator("Agent Sam - Supply & Demand Zones", overlay = true, max_boxes_count = 100, max_labels_count = 100)
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+grpBase = "Base"
+atrLen           = input.int(14, "ATR length", minval = 1, group = grpBase)
+maxBaseCandles   = input.int(5, "Max base candles", minval = 1, maxval = 5, group = grpBase)
+baseTightFullPct = input.float(25.0, "Base tightness: full score at (% ATR)", minval = 1.0, group = grpBase)
+baseTightMaxPct  = input.float(50.0, "Base tightness: reject above (% ATR)", minval = 1.0, group = grpBase)
+
+grpDep = "Departure"
+depModerateMult = input.float(1.2, "Reject departure below (x ATR)", minval = 0.1, group = grpDep)
+depFullScoreMult = input.float(2.5, "Departure full score at (x ATR)", minval = 0.1, group = grpDep)
+
+grpScore = "Scoring"
+reversalBiasPoints = input.float(2.0, "Bonus points for DBR/RBD (reversal bias)", minval = 0.0, maxval = 20.0, group = grpScore)
+stopBufferMult = input.float(0.15, "Stop buffer beyond distal (x ATR)", minval = 0.0, maxval = 0.5, group = grpScore)
+
+grpHtf = "Higher timeframe confluence"
+enableHTF = input.bool(true, "Enable HTF confluence", group = grpHtf)
+htfInput = input.timeframe("", "Higher timeframe (blank = auto)", group = grpHtf)
+pivotLen = input.int(3, "HTF pivot lookback", minval = 1, group = grpHtf)
+
+grpDisplay = "Display"
+maxZonesShown = input.int(5, "Max zones shown", minval = 1, maxval = 20, group = grpDisplay)
+boxExtendBars = input.int(20, "Box/label right extension (bars)", minval = 1, group = grpDisplay)
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+type Zone
+    bool isDemand
+    string pattern
+    int baseStartBar
+    int departureBar
+    float top
+    float bottom
+    int baseCandles
+    float tightnessPct
+    float departureMult
+    int touches
+    bool wasInside
+    bool invalidated
+    float atrAtCreation
+
+var array<Zone> demandZones = array.new<Zone>()
+var array<Zone> supplyZones = array.new<Zone>()
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+f_autoHTF() =>
+    string tf = timeframe.period
+    string result = switch tf
+        "1" => "15"
+        "3" => "15"
+        "5" => "30"
+        "15" => "60"
+        "30" => "240"
+        "60" => "240"
+        "120" => "D"
+        "240" => "D"
+        "D" => "W"
+        "W" => "M"
+        => "D"
+    result
+
+// Scans the `bl` candles immediately preceding the current bar as a
+// candidate base: returns its high/low band, whether every candle is tight
+// enough vs ATR, and whether the candles' ranges overlap a common band
+// (the "indecision cluster" signature).
+f_scanBase(bl) =>
+    float bHigh = na
+    float bLow = na
+    float minHigh = na
+    float maxLow = na
+    float maxRangePct = 0.0
+    for k = 1 to bl
+        hk = high[k]
+        lk = low[k]
+        bHigh := na(bHigh) ? hk : math.max(bHigh, hk)
+        bLow := na(bLow) ? lk : math.min(bLow, lk)
+        minHigh := na(minHigh) ? hk : math.min(minHigh, hk)
+        maxLow := na(maxLow) ? lk : math.max(maxLow, lk)
+        rangePct = (hk - lk) / atrVal * 100
+        maxRangePct := math.max(maxRangePct, rangePct)
+    tight = maxRangePct <= baseTightMaxPct
+    overlap = minHigh > maxLow
+    [bHigh, bLow, tight, overlap, maxRangePct]
+
+// Last confirmed pivot high/low on the (possibly higher) timeframe this
+// function is evaluated in — a lightweight proxy for "a zone one timeframe
+// up overlaps this price region" without re-running full base detection
+// inside request.security.
+f_htfPivots() =>
+    var float lastPH = na
+    var float lastPL = na
+    ph = ta.pivothigh(high, pivotLen, pivotLen)
+    pl = ta.pivotlow(low, pivotLen, pivotLen)
+    if not na(ph)
+        lastPH := ph
+    if not na(pl)
+        lastPL := pl
+    [lastPH, lastPL]
+
+f_score(z) =>
+    tScore = z.tightnessPct <= baseTightFullPct ? 25.0 : z.tightnessPct >= baseTightMaxPct ? 0.0 : 25.0 * (baseTightMaxPct - z.tightnessPct) / (baseTightMaxPct - baseTightFullPct)
+    dScore = z.departureMult >= depFullScoreMult ? 30.0 : z.departureMult <= depModerateMult ? 0.0 : 30.0 * (z.departureMult - depModerateMult) / (depFullScoreMult - depModerateMult)
+    fScore = z.touches == 0 ? 25.0 : z.touches == 1 ? 12.0 : 0.0
+    htfLevel = z.isDemand ? htfPL : htfPH
+    confluence = not na(htfLevel) and htfLevel <= z.top and htfLevel >= z.bottom
+    cScore = confluence ? 20.0 : 0.0
+    raw = tScore + dScore + fScore + cScore
+    bias = (z.pattern == "DBR" or z.pattern == "RBD") ? reversalBiasPoints : 0.0
+    score = math.min(100.0, raw + bias)
+    [score, confluence]
+
+// ---------------------------------------------------------------------------
+// Zone detection (runs every bar)
+// ---------------------------------------------------------------------------
+atrVal = ta.atr(atrLen)
+resolvedHTF = htfInput == "" ? f_autoHTF() : htfInput
+
+htfPH = float(na)
+htfPL = float(na)
+if enableHTF
+    [ph, pl] = request.security(syminfo.tickerid, resolvedHTF, f_htfPivots())
+    htfPH := ph
+    htfPL := pl
+
+bool addedZone = false
+
+if bar_index > maxBaseCandles + 1
+    for bl = maxBaseCandles to 1
+        if not addedZone
+            [bHigh, bLow, tight, overlap, maxRangePct] = f_scanBase(bl)
+            if tight and overlap
+                depRange = high - low
+                depMult = depRange / atrVal
+                depBullish = close > open and close > bHigh
+                depBearish = close < open and close < bLow
+                if depMult >= depModerateMult and (depBullish or depBearish)
+                    legInBullish = close[bl + 1] > open[bl + 1]
+                    if depBullish
+                        pat = legInBullish ? "RBR" : "DBR"
+                        nz = Zone.new(isDemand = true, pattern = pat, baseStartBar = bar_index - bl, departureBar = bar_index, top = bHigh, bottom = bLow, baseCandles = bl, tightnessPct = maxRangePct, departureMult = depMult, touches = 0, wasInside = false, invalidated = false, atrAtCreation = atrVal)
+                        array.push(demandZones, nz)
+                        addedZone := true
+                    if depBearish
+                        pat2 = legInBullish ? "RBD" : "DBD"
+                        nz2 = Zone.new(isDemand = false, pattern = pat2, baseStartBar = bar_index - bl, departureBar = bar_index, top = bHigh, bottom = bLow, baseCandles = bl, tightnessPct = maxRangePct, departureMult = depMult, touches = 0, wasInside = false, invalidated = false, atrAtCreation = atrVal)
+                        array.push(supplyZones, nz2)
+                        addedZone := true
+
+alertcondition(addedZone, "New Zone Formed", "New supply/demand zone formed on {{ticker}} {{interval}}")
+
+// ---------------------------------------------------------------------------
+// Update freshness / invalidation on every bar
+// ---------------------------------------------------------------------------
+for i = 0 to array.size(demandZones) - 1
+    z = array.get(demandZones, i)
+    if not z.invalidated
+        inside = low <= z.top and high >= z.bottom
+        if inside and not z.wasInside
+            z.touches += 1
+        z.wasInside := inside
+        if close < z.bottom
+            z.invalidated := true
+
+for i = 0 to array.size(supplyZones) - 1
+    z = array.get(supplyZones, i)
+    if not z.invalidated
+        inside = low <= z.top and high >= z.bottom
+        if inside and not z.wasInside
+            z.touches += 1
+        z.wasInside := inside
+        if close > z.top
+            z.invalidated := true
+
+// Bound memory: drop oldest zones once the lists grow large.
+while array.size(demandZones) > 200
+    array.shift(demandZones)
+while array.size(supplyZones) > 200
+    array.shift(supplyZones)
+
+// ---------------------------------------------------------------------------
+// Render: top N zones by quality score, redrawn on every update
+// ---------------------------------------------------------------------------
+var array<box> drawnBoxes = array.new<box>()
+var array<label> drawnLabels = array.new<label>()
+var table infoTable = na
+
+if barstate.islast
+    for i = 0 to array.size(drawnBoxes) - 1
+        box.delete(array.get(drawnBoxes, i))
+    array.clear(drawnBoxes)
+    for i = 0 to array.size(drawnLabels) - 1
+        label.delete(array.get(drawnLabels, i))
+    array.clear(drawnLabels)
+    if not na(infoTable)
+        table.delete(infoTable)
+
+    array<Zone> candidates = array.new<Zone>()
+    array<float> scores = array.new<float>()
+    array<bool> confs = array.new<bool>()
+
+    for i = 0 to array.size(demandZones) - 1
+        z = array.get(demandZones, i)
+        if not z.invalidated and z.touches <= 1
+            [s, c] = f_score(z)
+            array.push(candidates, z)
+            array.push(scores, s)
+            array.push(confs, c)
+    for i = 0 to array.size(supplyZones) - 1
+        z = array.get(supplyZones, i)
+        if not z.invalidated and z.touches <= 1
+            [s, c] = f_score(z)
+            array.push(candidates, z)
+            array.push(scores, s)
+            array.push(confs, c)
+
+    if array.size(scores) > 0
+        idx = array.sort_indices(scores, order.descending)
+        n = math.min(maxZonesShown, array.size(idx))
+
+        infoTable := table.new(position.top_right, 8, n + 1, bgcolor = color.new(color.black, 80), border_width = 1, border_color = color.gray)
+        table.cell(infoTable, 0, 0, "Type", text_color = color.white)
+        table.cell(infoTable, 1, 0, "Pat", text_color = color.white)
+        table.cell(infoTable, 2, 0, "Score", text_color = color.white)
+        table.cell(infoTable, 3, 0, "Proximal", text_color = color.white)
+        table.cell(infoTable, 4, 0, "Distal", text_color = color.white)
+        table.cell(infoTable, 5, 0, "Stop", text_color = color.white)
+        table.cell(infoTable, 6, 0, "Touch", text_color = color.white)
+        table.cell(infoTable, 7, 0, "Conf", text_color = color.white)
+
+        for r = 0 to n - 1
+            ii = array.get(idx, r)
+            z = array.get(candidates, ii)
+            sc = array.get(scores, ii)
+            conf = array.get(confs, ii)
+            zoneColor = z.isDemand ? color.green : color.red
+
+            proximal = z.isDemand ? z.top : z.bottom
+            distal = z.isDemand ? z.bottom : z.top
+            stop = z.isDemand ? z.bottom - stopBufferMult * z.atrAtCreation : z.top + stopBufferMult * z.atrAtCreation
+            risk = math.abs(proximal - stop)
+            target2R = z.isDemand ? proximal + 2 * risk : proximal - 2 * risk
+
+            bx = box.new(left = z.baseStartBar, top = z.top, bottom = z.bottom, right = bar_index + boxExtendBars, border_color = zoneColor, bgcolor = color.new(zoneColor, 85))
+            array.push(drawnBoxes, bx)
+
+            labelText = z.pattern + " | score " + str.tostring(math.round(sc)) + "\nprox " + str.tostring(proximal, format.mintick) + " / dist " + str.tostring(distal, format.mintick) + "\nstop " + str.tostring(stop, format.mintick) + " | 2R " + str.tostring(target2R, format.mintick) + "\ntouches " + str.tostring(z.touches) + (conf ? " | HTF confluence" : "")
+            lbl = label.new(bar_index + boxExtendBars, z.isDemand ? z.bottom : z.top, text = labelText, style = z.isDemand ? label.style_label_up : label.style_label_down, color = color.new(zoneColor, 0), textcolor = color.white, size = size.small)
+            array.push(drawnLabels, lbl)
+
+            table.cell(infoTable, 0, r + 1, z.isDemand ? "Demand" : "Supply", text_color = zoneColor)
+            table.cell(infoTable, 1, r + 1, z.pattern, text_color = color.white)
+            table.cell(infoTable, 2, r + 1, str.tostring(math.round(sc)), text_color = color.white)
+            table.cell(infoTable, 3, r + 1, str.tostring(proximal, format.mintick), text_color = color.white)
+            table.cell(infoTable, 4, r + 1, str.tostring(distal, format.mintick), text_color = color.white)
+            table.cell(infoTable, 5, r + 1, str.tostring(stop, format.mintick), text_color = color.white)
+            table.cell(infoTable, 6, r + 1, str.tostring(z.touches), text_color = color.white)
+            table.cell(infoTable, 7, r + 1, conf ? "Y" : "-", text_color = color.white)
