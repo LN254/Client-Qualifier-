@@ -54,8 +54,12 @@ var array<Zone> demandZones = array.new<Zone>()
 var array<Zone> supplyZones = array.new<Zone>()
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Globals every helper function below depends on must be declared first —
+// Pine does not allow a function body to forward-reference a global that
+// is assigned later in the script.
 // ---------------------------------------------------------------------------
+atrVal = ta.atr(atrLen)
+
 f_autoHTF() =>
     string tf = timeframe.period
     string result = switch tf
@@ -71,6 +75,34 @@ f_autoHTF() =>
         "W" => "M"
         => "D"
     result
+
+resolvedHTF = htfInput == "" ? f_autoHTF() : htfInput
+
+// Last confirmed pivot high/low on the (possibly higher) timeframe this
+// function is evaluated in — a lightweight proxy for "a zone one timeframe
+// up overlaps this price region" without re-running full base detection
+// inside request.security.
+f_htfPivots() =>
+    var float lastPH = na
+    var float lastPL = na
+    ph = ta.pivothigh(high, pivotLen, pivotLen)
+    pl = ta.pivotlow(low, pivotLen, pivotLen)
+    if not na(ph)
+        lastPH := ph
+    if not na(pl)
+        lastPL := pl
+    [lastPH, lastPL]
+
+htfPH = float(na)
+htfPL = float(na)
+if enableHTF
+    [ph, pl] = request.security(syminfo.tickerid, resolvedHTF, f_htfPivots())
+    htfPH := ph
+    htfPL := pl
+
+// ---------------------------------------------------------------------------
+// Helpers that depend on the globals above
+// ---------------------------------------------------------------------------
 
 // Scans the `bl` candles immediately preceding the current bar as a
 // candidate base: returns its high/low band, whether every candle is tight
@@ -95,21 +127,6 @@ f_scanBase(bl) =>
     overlap = minHigh > maxLow
     [bHigh, bLow, tight, overlap, maxRangePct]
 
-// Last confirmed pivot high/low on the (possibly higher) timeframe this
-// function is evaluated in — a lightweight proxy for "a zone one timeframe
-// up overlaps this price region" without re-running full base detection
-// inside request.security.
-f_htfPivots() =>
-    var float lastPH = na
-    var float lastPL = na
-    ph = ta.pivothigh(high, pivotLen, pivotLen)
-    pl = ta.pivotlow(low, pivotLen, pivotLen)
-    if not na(ph)
-        lastPH := ph
-    if not na(pl)
-        lastPL := pl
-    [lastPH, lastPL]
-
 f_score(z) =>
     tScore = z.tightnessPct <= baseTightFullPct ? 25.0 : z.tightnessPct >= baseTightMaxPct ? 0.0 : 25.0 * (baseTightMaxPct - z.tightnessPct) / (baseTightMaxPct - baseTightFullPct)
     dScore = z.departureMult >= depFullScoreMult ? 30.0 : z.departureMult <= depModerateMult ? 0.0 : 30.0 * (z.departureMult - depModerateMult) / (depFullScoreMult - depModerateMult)
@@ -125,16 +142,6 @@ f_score(z) =>
 // ---------------------------------------------------------------------------
 // Zone detection (runs every bar)
 // ---------------------------------------------------------------------------
-atrVal = ta.atr(atrLen)
-resolvedHTF = htfInput == "" ? f_autoHTF() : htfInput
-
-htfPH = float(na)
-htfPL = float(na)
-if enableHTF
-    [ph, pl] = request.security(syminfo.tickerid, resolvedHTF, f_htfPivots())
-    htfPH := ph
-    htfPL := pl
-
 bool addedZone = false
 
 if bar_index > maxBaseCandles + 1
