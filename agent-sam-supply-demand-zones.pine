@@ -171,7 +171,7 @@ alertcondition(addedZone, "New Zone Formed", "New supply/demand zone formed on {
 // ---------------------------------------------------------------------------
 // Update freshness / invalidation on every bar
 // ---------------------------------------------------------------------------
-for i = 0 to array.size(demandZones) - 1
+for i = 0 to array.size(demandZones) - 1 by 1
     z = array.get(demandZones, i)
     if not z.invalidated
         inside = low <= z.top and high >= z.bottom
@@ -181,7 +181,7 @@ for i = 0 to array.size(demandZones) - 1
         if close < z.bottom
             z.invalidated := true
 
-for i = 0 to array.size(supplyZones) - 1
+for i = 0 to array.size(supplyZones) - 1 by 1
     z = array.get(supplyZones, i)
     if not z.invalidated
         inside = low <= z.top and high >= z.bottom
@@ -205,10 +205,10 @@ var array<label> drawnLabels = array.new<label>()
 var table infoTable = na
 
 if barstate.islast
-    for i = 0 to array.size(drawnBoxes) - 1
+    for i = 0 to array.size(drawnBoxes) - 1 by 1
         box.delete(array.get(drawnBoxes, i))
     array.clear(drawnBoxes)
-    for i = 0 to array.size(drawnLabels) - 1
+    for i = 0 to array.size(drawnLabels) - 1 by 1
         label.delete(array.get(drawnLabels, i))
     array.clear(drawnLabels)
     if not na(infoTable)
@@ -218,14 +218,14 @@ if barstate.islast
     array<float> scores = array.new<float>()
     array<bool> confs = array.new<bool>()
 
-    for i = 0 to array.size(demandZones) - 1
+    for i = 0 to array.size(demandZones) - 1 by 1
         z = array.get(demandZones, i)
         if not z.invalidated and z.touches <= 1
             [s, c] = f_score(z)
             array.push(candidates, z)
             array.push(scores, s)
             array.push(confs, c)
-    for i = 0 to array.size(supplyZones) - 1
+    for i = 0 to array.size(supplyZones) - 1 by 1
         z = array.get(supplyZones, i)
         if not z.invalidated and z.touches <= 1
             [s, c] = f_score(z)
@@ -247,7 +247,7 @@ if barstate.islast
         table.cell(infoTable, 6, 0, "Touch", text_color = color.white)
         table.cell(infoTable, 7, 0, "Conf", text_color = color.white)
 
-        for r = 0 to n - 1
+        for r = 0 to n - 1 by 1
             ii = array.get(idx, r)
             z = array.get(candidates, ii)
             sc = array.get(scores, ii)
