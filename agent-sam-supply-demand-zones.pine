@@ -171,8 +171,9 @@ alertcondition(addedZone, "New Zone Formed", "New supply/demand zone formed on {
 // ---------------------------------------------------------------------------
 // Update freshness / invalidation on every bar
 // ---------------------------------------------------------------------------
-for i = 0 to array.size(demandZones) - 1 by 1
-    z = array.get(demandZones, i)
+di = 0
+while di < array.size(demandZones)
+    z = array.get(demandZones, di)
     if not z.invalidated
         inside = low <= z.top and high >= z.bottom
         if inside and not z.wasInside
@@ -180,9 +181,11 @@ for i = 0 to array.size(demandZones) - 1 by 1
         z.wasInside := inside
         if close < z.bottom
             z.invalidated := true
+    di += 1
 
-for i = 0 to array.size(supplyZones) - 1 by 1
-    z = array.get(supplyZones, i)
+si = 0
+while si < array.size(supplyZones)
+    z = array.get(supplyZones, si)
     if not z.invalidated
         inside = low <= z.top and high >= z.bottom
         if inside and not z.wasInside
@@ -190,6 +193,7 @@ for i = 0 to array.size(supplyZones) - 1 by 1
         z.wasInside := inside
         if close > z.top
             z.invalidated := true
+    si += 1
 
 // Bound memory: drop oldest zones once the lists grow large.
 while array.size(demandZones) > 200
@@ -205,11 +209,15 @@ var array<label> drawnLabels = array.new<label>()
 var table infoTable = na
 
 if barstate.islast
-    for i = 0 to array.size(drawnBoxes) - 1 by 1
-        box.delete(array.get(drawnBoxes, i))
+    bxi = 0
+    while bxi < array.size(drawnBoxes)
+        box.delete(array.get(drawnBoxes, bxi))
+        bxi += 1
     array.clear(drawnBoxes)
-    for i = 0 to array.size(drawnLabels) - 1 by 1
-        label.delete(array.get(drawnLabels, i))
+    lbi = 0
+    while lbi < array.size(drawnLabels)
+        label.delete(array.get(drawnLabels, lbi))
+        lbi += 1
     array.clear(drawnLabels)
     if not na(infoTable)
         table.delete(infoTable)
@@ -218,20 +226,24 @@ if barstate.islast
     array<float> scores = array.new<float>()
     array<bool> confs = array.new<bool>()
 
-    for i = 0 to array.size(demandZones) - 1 by 1
-        z = array.get(demandZones, i)
+    dci = 0
+    while dci < array.size(demandZones)
+        z = array.get(demandZones, dci)
         if not z.invalidated and z.touches <= 1
             [s, c] = f_score(z)
             array.push(candidates, z)
             array.push(scores, s)
             array.push(confs, c)
-    for i = 0 to array.size(supplyZones) - 1 by 1
-        z = array.get(supplyZones, i)
+        dci += 1
+    sci = 0
+    while sci < array.size(supplyZones)
+        z = array.get(supplyZones, sci)
         if not z.invalidated and z.touches <= 1
             [s, c] = f_score(z)
             array.push(candidates, z)
             array.push(scores, s)
             array.push(confs, c)
+        sci += 1
 
     if array.size(scores) > 0
         idx = array.sort_indices(scores, order.descending)
