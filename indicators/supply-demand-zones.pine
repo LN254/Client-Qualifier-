@@ -1,0 +1,199 @@
+// This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=5
+indicator("Supply & Demand Zones (Drop-Base-Rally / Rally-Base-Drop)", overlay = true, max_boxes_count = 500, max_lines_count = 500)
+
+// ─────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────
+grpZones   = "Zone Detection"
+atrLen     = input.int(14, "ATR Length", minval = 1, group = grpZones)
+legMult    = input.float(1.5, "Leg (Rally/Drop) Strength — x ATR", minval = 0.1, step = 0.1, group = grpZones,
+     tooltip = "A candle must have a body of at least this many ATRs to count as a strong Rally or Drop leg.")
+baseMult   = input.float(0.5, "Base Candle Size — x ATR", minval = 0.05, step = 0.05, group = grpZones,
+     tooltip = "A candle's body must be no larger than this many ATRs to count as a basing (consolidation) candle.")
+minBase    = input.int(1, "Min Base Candles", minval = 1, maxval = 10, group = grpZones)
+maxBase    = input.int(3, "Max Base Candles", minval = 1, maxval = 10, group = grpZones)
+
+grpDisplay = "Display"
+showDemand = input.bool(true,  "Show Demand Zones", group = grpDisplay)
+showSupply = input.bool(true,  "Show Supply Zones", group = grpDisplay)
+extendBars = input.int(30, "Extend Zone Forward (bars)", minval = 1, group = grpDisplay)
+maxZonesEa = input.int(10, "Max Zones Kept (each side)", minval = 1, maxval = 100, group = grpDisplay)
+mitigation = input.string("Dim", "On Mitigation", options = ["None", "Dim", "Delete"], group = grpDisplay,
+     tooltip = "What happens to a zone once price trades back into it.")
+
+demandColor = input.color(color.new(color.green, 80), "Demand Zone Color", group = grpDisplay)
+demandLine  = input.color(color.new(color.green, 0),  "Demand Line Color",  group = grpDisplay)
+supplyColor = input.color(color.new(color.red, 80),   "Supply Zone Color", group = grpDisplay)
+supplyLine  = input.color(color.new(color.red, 0),    "Supply Line Color",  group = grpDisplay)
+dimColor    = input.color(color.new(color.gray, 90),  "Mitigated Zone Color", group = grpDisplay)
+
+grpAlert   = "Alerts"
+alertNew   = input.bool(true, "Alert on New Zone", group = grpAlert)
+alertMit   = input.bool(true, "Alert on Mitigation", group = grpAlert)
+
+// ─────────────────────────────────────────────────────────────────────────
+// STATE
+// ─────────────────────────────────────────────────────────────────────────
+atr = ta.atr(atrLen)
+
+isBullLeg(i) => (close[i] - open[i]) >= atr[i] * legMult
+isBearLeg(i) => (open[i] - close[i]) >= atr[i] * legMult
+isBaseCandle(i) => math.abs(close[i] - open[i]) <= atr[i] * baseMult
+
+var box[]  demandBoxes  = array.new_box()
+var line[] demandProx   = array.new_line()
+var line[] demandDist   = array.new_line()
+var float[] demandTop   = array.new_float()
+var float[] demandBot   = array.new_float()
+var bool[]  demandLive  = array.new_bool()
+
+var box[]  supplyBoxes  = array.new_box()
+var line[] supplyProx   = array.new_line()
+var line[] supplyDist   = array.new_line()
+var float[] supplyTop   = array.new_float()
+var float[] supplyBot   = array.new_float()
+var bool[]  supplyLive  = array.new_bool()
+
+// ─────────────────────────────────────────────────────────────────────────
+// PATTERN DETECTION
+// The "leg" (rally or drop) candle is the current bar. Base candles sit
+// immediately before it, and the opposite leg sits immediately before the base.
+// ─────────────────────────────────────────────────────────────────────────
+// Demand Zone: Drop (leg behind base) -> Base -> Rally (current candle)
+if showDemand and bar_index > maxBase + 2
+    // Walk backward from bar 1 (just before the current leg candle) counting
+    // consecutive base candles, then confirm a Drop leg immediately behind them.
+    baseLen = 0
+    found   = false
+    for n = minBase to maxBase
+        allBase = true
+        for k = 1 to n
+            if not isBaseCandle(k)
+                allBase := false
+                break
+        if allBase and isBearLeg(n + 1)
+            baseLen := n
+            found   := true
+            break
+    if found and isBullLeg(0)
+        top = 0.0
+        bot = 10e10
+        for k = 1 to baseLen
+            top := math.max(top, math.max(open[k], close[k]))
+            bot := math.min(bot, low[k])
+        leftBar  = bar_index - baseLen
+        rightBar = bar_index + extendBars
+
+        bx = box.new(leftBar, top, rightBar, bot, border_color = demandLine, bgcolor = demandColor, extend = extend.none)
+        pl = line.new(leftBar, top, rightBar, top, color = demandLine, style = line.style_solid)
+        dl = line.new(leftBar, bot, rightBar, bot, color = demandLine, style = line.style_dashed)
+
+        array.push(demandBoxes, bx)
+        array.push(demandProx, pl)
+        array.push(demandDist, dl)
+        array.push(demandTop, top)
+        array.push(demandBot, bot)
+        array.push(demandLive, true)
+
+        if array.size(demandBoxes) > maxZonesEa
+            box.delete(array.shift(demandBoxes))
+            line.delete(array.shift(demandProx))
+            line.delete(array.shift(demandDist))
+            array.shift(demandTop)
+            array.shift(demandBot)
+            array.shift(demandLive)
+
+        if alertNew
+            alert("New Demand Zone: " + str.tostring(bot, format.mintick) + " - " + str.tostring(top, format.mintick), alert.freq_once_per_bar_close)
+
+// Supply Zone: Rally (leg behind base) -> Base -> Drop (current candle)
+if showSupply and bar_index > maxBase + 2
+    // Walk backward from bar 1 (just before the current leg candle) counting
+    // consecutive base candles, then confirm a Rally leg immediately behind them.
+    baseLen = 0
+    found   = false
+    for n = minBase to maxBase
+        allBase = true
+        for k = 1 to n
+            if not isBaseCandle(k)
+                allBase := false
+                break
+        if allBase and isBullLeg(n + 1)
+            baseLen := n
+            found   := true
+            break
+    if found and isBearLeg(0)
+        top = 0.0
+        bot = 10e10
+        for k = 1 to baseLen
+            bot := math.min(bot, math.min(open[k], close[k]))
+            top := math.max(top, high[k])
+        leftBar  = bar_index - baseLen
+        rightBar = bar_index + extendBars
+
+        bx = box.new(leftBar, top, rightBar, bot, border_color = supplyLine, bgcolor = supplyColor, extend = extend.none)
+        pl = line.new(leftBar, bot, rightBar, bot, color = supplyLine, style = line.style_solid)
+        dl = line.new(leftBar, top, rightBar, top, color = supplyLine, style = line.style_dashed)
+
+        array.push(supplyBoxes, bx)
+        array.push(supplyProx, pl)
+        array.push(supplyDist, dl)
+        array.push(supplyTop, top)
+        array.push(supplyBot, bot)
+        array.push(supplyLive, true)
+
+        if array.size(supplyBoxes) > maxZonesEa
+            box.delete(array.shift(supplyBoxes))
+            line.delete(array.shift(supplyProx))
+            line.delete(array.shift(supplyDist))
+            array.shift(supplyTop)
+            array.shift(supplyBot)
+            array.shift(supplyLive)
+
+        if alertNew
+            alert("New Supply Zone: " + str.tostring(bot, format.mintick) + " - " + str.tostring(top, format.mintick), alert.freq_once_per_bar_close)
+
+// ─────────────────────────────────────────────────────────────────────────
+// MITIGATION — extend live zones forward each bar, and mark/remove once price returns
+// ─────────────────────────────────────────────────────────────────────────
+manageZones(boxes, proxLines, distLines, tops, bots, lives) =>
+    for i = array.size(boxes) - 1 to 0
+        bx   = array.get(boxes, i)
+        pl   = array.get(proxLines, i)
+        dl   = array.get(distLines, i)
+        top  = array.get(tops, i)
+        bot  = array.get(bots, i)
+        live = array.get(lives, i)
+
+        if live
+            box.set_right(bx, bar_index)
+            line.set_x2(pl, bar_index)
+            line.set_x2(dl, bar_index)
+
+            touched = low <= top and high >= bot
+            if touched
+                if mitigation == "Delete"
+                    box.delete(bx)
+                    line.delete(pl)
+                    line.delete(dl)
+                    array.remove(boxes, i)
+                    array.remove(proxLines, i)
+                    array.remove(distLines, i)
+                    array.remove(tops, i)
+                    array.remove(bots, i)
+                    array.remove(lives, i)
+                else if mitigation == "Dim"
+                    box.set_bgcolor(bx, dimColor)
+                    box.set_border_color(bx, dimColor)
+                    line.set_color(pl, dimColor)
+                    line.set_color(dl, dimColor)
+                    array.set(lives, i, false)
+                else
+                    array.set(lives, i, false)
+
+                if alertMit
+                    alert("Zone mitigated: " + str.tostring(bot, format.mintick) + " - " + str.tostring(top, format.mintick), alert.freq_once_per_bar_close)
+
+manageZones(demandBoxes, demandProx, demandDist, demandTop, demandBot, demandLive)
+manageZones(supplyBoxes, supplyProx, supplyDist, supplyTop, supplyBot, supplyLive)
