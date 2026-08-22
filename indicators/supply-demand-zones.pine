@@ -158,42 +158,44 @@ if showSupply and bar_index > maxBase + 2
 // MITIGATION — extend live zones forward each bar, and mark/remove once price returns
 // ─────────────────────────────────────────────────────────────────────────
 manageZones(boxes, proxLines, distLines, tops, bots, lives) =>
-    for i = array.size(boxes) - 1 to 0
-        bx   = array.get(boxes, i)
-        pl   = array.get(proxLines, i)
-        dl   = array.get(distLines, i)
-        top  = array.get(tops, i)
-        bot  = array.get(bots, i)
-        live = array.get(lives, i)
+    n = array.size(boxes)
+    if n > 0
+        for i = n - 1 to 0
+            bx   = array.get(boxes, i)
+            pl   = array.get(proxLines, i)
+            dl   = array.get(distLines, i)
+            top  = array.get(tops, i)
+            bot  = array.get(bots, i)
+            live = array.get(lives, i)
 
-        if live
-            box.set_right(bx, bar_index)
-            line.set_x2(pl, bar_index)
-            line.set_x2(dl, bar_index)
+            if live
+                box.set_right(bx, bar_index)
+                line.set_x2(pl, bar_index)
+                line.set_x2(dl, bar_index)
 
-            touched = low <= top and high >= bot
-            if touched
-                if mitigation == "Delete"
-                    box.delete(bx)
-                    line.delete(pl)
-                    line.delete(dl)
-                    array.remove(boxes, i)
-                    array.remove(proxLines, i)
-                    array.remove(distLines, i)
-                    array.remove(tops, i)
-                    array.remove(bots, i)
-                    array.remove(lives, i)
-                else if mitigation == "Dim"
-                    box.set_bgcolor(bx, dimColor)
-                    box.set_border_color(bx, dimColor)
-                    line.set_color(pl, dimColor)
-                    line.set_color(dl, dimColor)
-                    array.set(lives, i, false)
-                else
-                    array.set(lives, i, false)
+                touched = low <= top and high >= bot
+                if touched
+                    if mitigation == "Delete"
+                        box.delete(bx)
+                        line.delete(pl)
+                        line.delete(dl)
+                        array.remove(boxes, i)
+                        array.remove(proxLines, i)
+                        array.remove(distLines, i)
+                        array.remove(tops, i)
+                        array.remove(bots, i)
+                        array.remove(lives, i)
+                    else if mitigation == "Dim"
+                        box.set_bgcolor(bx, dimColor)
+                        box.set_border_color(bx, dimColor)
+                        line.set_color(pl, dimColor)
+                        line.set_color(dl, dimColor)
+                        array.set(lives, i, false)
+                    else
+                        array.set(lives, i, false)
 
-                if alertMit
-                    alert("Zone mitigated: " + str.tostring(bot, format.mintick) + " - " + str.tostring(top, format.mintick), alert.freq_once_per_bar_close)
+                    if alertMit
+                        alert("Zone mitigated: " + str.tostring(bot, format.mintick) + " - " + str.tostring(top, format.mintick), alert.freq_once_per_bar_close)
 
 manageZones(demandBoxes, demandProx, demandDist, demandTop, demandBot, demandLive)
 manageZones(supplyBoxes, supplyProx, supplyDist, supplyTop, supplyBot, supplyLive)
