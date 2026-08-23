@@ -1,0 +1,451 @@
+//@version=5
+// ============================================================================
+// SMC / ICT Market Structure & POI Suite
+// ----------------------------------------------------------------------------
+// NOTE: Structure (BOS/CHoCH), order blocks and FVGs confirm only on bar
+// close (non-repainting once a bar is closed). Liquidity-sweep detection and
+// FVG-fill detection use the current bar's intrabar high/low, so a live
+// (unclosed) bar's sweep/fill state can still change until that bar closes;
+// once closed, the flag is final and is never re-evaluated. Order blocks are
+// searched for on the same closed bar that produces the BOS/CHoCH, so no
+// forward-looking data is used.
+// ============================================================================
+indicator("SMC/ICT Market Structure & POI Suite", shorttitle="SMC/ICT POI", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+grp_structure = "Market Structure"
+showStructure    = input.bool(true, "Show BOS / CHoCH", group=grp_structure)
+swingLookback    = input.int(5, "Swing Lookback (bars left/right)", minval=1, maxval=50, group=grp_structure)
+bullStructColor  = input.color(color.new(color.teal, 0), "Bullish Structure Color", group=grp_structure)
+bearStructColor  = input.color(color.new(color.red, 0), "Bearish Structure Color", group=grp_structure)
+
+grp_liquidity = "Liquidity"
+showLiquidity    = input.bool(true, "Show Liquidity Pools", group=grp_liquidity)
+eqTolerancePct   = input.float(0.1, "Equal High/Low Tolerance (%)", minval=0.0, step=0.01, group=grp_liquidity)
+maxLiquidity     = input.int(10, "Max Liquidity Pools Displayed", minval=1, maxval=30, group=grp_liquidity)
+restingLiqColor  = input.color(color.new(color.yellow, 0), "Resting Liquidity Color", group=grp_liquidity)
+sweptLiqColor    = input.color(color.new(color.gray, 60), "Swept (Inactive) Liquidity Color", group=grp_liquidity)
+
+grp_ob = "Order Blocks"
+showOB           = input.bool(true, "Show Order Blocks", group=grp_ob)
+maxOB            = input.int(5, "Max Order Blocks Displayed", minval=1, maxval=20, group=grp_ob)
+mitigationPct    = input.float(50, "Mitigation Threshold (%)", minval=1, maxval=100, group=grp_ob)
+bullOBColor      = input.color(color.new(color.teal, 70), "Bullish OB (Demand) Color", group=grp_ob)
+bearOBColor      = input.color(color.new(color.red, 70), "Bearish OB (Supply) Color", group=grp_ob)
+mitigatedOBColor = input.color(color.new(color.gray, 85), "Mitigated OB Color", group=grp_ob)
+
+grp_fvg = "Fair Value Gaps"
+showFVG          = input.bool(true, "Show Fair Value Gaps", group=grp_fvg)
+maxFVG           = input.int(5, "Max FVGs Displayed", minval=1, maxval=20, group=grp_fvg)
+fvgAutoDelete    = input.bool(true, "Auto-delete Filled FVGs", group=grp_fvg)
+fvgDeleteBars    = input.int(50, "Delete Filled FVGs After N Bars", minval=1, group=grp_fvg)
+bullFVGColor     = input.color(color.new(color.blue, 75), "Bullish FVG Color", group=grp_fvg)
+bearFVGColor     = input.color(color.new(color.orange, 75), "Bearish FVG Color", group=grp_fvg)
+filledFVGColor   = input.color(color.new(color.gray, 85), "Filled FVG Color", group=grp_fvg)
+
+grp_poi = "Points of Interest"
+showPOI              = input.bool(true, "Show POI Zones", group=grp_poi)
+highConfluenceColor  = input.color(color.new(color.purple, 30), "High-Confluence POI Color", group=grp_poi)
+lowConfluenceColor   = input.color(color.new(color.purple, 75), "Single/Dual-Factor POI Color", group=grp_poi)
+
+grp_htf = "Higher Timeframe Filter"
+useHTFFilter = input.bool(false, "Filter POIs by HTF Trend", group=grp_htf)
+htfTimeframe = input.timeframe("240", "HTF Timeframe", group=grp_htf)
+// NOTE: HTF trend is approximated with a 20/50 EMA cross on the higher
+// timeframe (fast > slow = bullish HTF bias) rather than re-running full
+// swing-structure detection on the HTF series, to keep the HTF request
+// lightweight and non-repainting (barmerge.lookahead_off, closed HTF bars only).
+
+// ============================================================================
+// TYPE DEFINITIONS
+// ============================================================================
+type OrderBlock
+    box   b
+    float top
+    float bottom
+    bool  bullish
+    bool  mitigated
+    int   createdBar
+
+type FVGZone
+    box   b
+    float top
+    float bottom
+    bool  bullish
+    bool  filled
+    int   createdBar
+    int   filledBar
+
+type LiquidityLevel
+    line  ln
+    label lbl
+    float price
+    bool  isHigh
+    bool  swept
+    int   startBar
+
+type StructureMark
+    line  ln
+    label lbl
+
+type POIZone
+    box   b
+    float top
+    float bottom
+    bool  bullish
+    int   confluence
+
+var array<OrderBlock>      obList      = array.new<OrderBlock>()
+var array<FVGZone>         fvgList     = array.new<FVGZone>()
+var array<LiquidityLevel>  liqList     = array.new<LiquidityLevel>()
+var array<StructureMark>   structMarks = array.new<StructureMark>()
+var array<POIZone>         poiList     = array.new<POIZone>()
+
+const int MAX_STRUCT_MARKS = 50
+
+// ============================================================================
+// ALERT SIGNAL FLAGS (recomputed every bar, referenced by alertcondition())
+// ============================================================================
+bool bosBullSignal      = false
+bool bosBearSignal      = false
+bool chochBullSignal    = false
+bool chochBearSignal    = false
+bool newBullOBSignal    = false
+bool newBearOBSignal    = false
+bool newBullFVGSignal   = false
+bool newBearFVGSignal   = false
+bool sweepBullSignal    = false
+bool sweepBearSignal    = false
+bool priceInPOISignal   = false
+
+// ============================================================================
+// HELPER: find the last opposite-colored candle before an impulsive move
+// (scans backward from the current, breakout bar). Returns [top, bottom, offset]
+// or [na, na, na] if none is found within maxLookback bars.
+// ============================================================================
+f_findLastOppositeCandle(maxLookback, bullishOB) =>
+    float obTop = na
+    float obBot = na
+    int obOffset = na
+    for i = 1 to maxLookback
+        if na(obOffset)
+            bool isBearCandle = close[i] < open[i]
+            bool isBullCandle = close[i] > open[i]
+            if bullishOB and isBearCandle
+                obTop := high[i]
+                obBot := low[i]
+                obOffset := i
+            if not bullishOB and isBullCandle
+                obTop := high[i]
+                obBot := low[i]
+                obOffset := i
+    [obTop, obBot, obOffset]
+
+// ============================================================================
+// SECTION 1: MARKET STRUCTURE (swing pivots, BOS / CHoCH)
+// ============================================================================
+var float swH        = na
+var int   swHBar      = na
+var bool  swHBroken    = true
+var float swL        = na
+var int   swLBar      = na
+var bool  swLBroken    = true
+var int   trendState   = 0   // 1 = bullish structure, -1 = bearish, 0 = undefined
+
+var array<float> swingHighs     = array.new<float>()
+var array<int>   swingHighBars  = array.new<int>()
+var array<float> swingLows      = array.new<float>()
+var array<int>   swingLowBars   = array.new<int>()
+
+float ph = ta.pivothigh(high, swingLookback, swingLookback)
+float pl = ta.pivotlow(low, swingLookback, swingLookback)
+
+if not na(ph)
+    swH := ph
+    swHBar := bar_index - swingLookback
+    swHBroken := false
+    array.push(swingHighs, ph)
+    array.push(swingHighBars, bar_index - swingLookback)
+    if array.size(swingHighs) > 20
+        array.shift(swingHighs)
+        array.shift(swingHighBars)
+    // Equal-highs liquidity pool check against earlier swing highs
+    if showLiquidity and array.size(swingHighs) > 1
+        for i = 0 to array.size(swingHighs) - 2
+            float lvl = array.get(swingHighs, i)
+            if math.abs(ph - lvl) / lvl * 100 <= eqTolerancePct
+                float avgPrice = (ph + lvl) / 2
+                int startB = array.get(swingHighBars, i)
+                LiquidityLevel liq = LiquidityLevel.new(price=avgPrice, isHigh=true, swept=false, startBar=startB)
+                liq.ln := line.new(startB, avgPrice, bar_index, avgPrice, color=restingLiqColor, style=line.style_dashed)
+                liq.lbl := label.new(bar_index, avgPrice, "EQH", style=label.style_label_left, color=color.new(color.white, 100), textcolor=restingLiqColor, size=size.tiny)
+                array.push(liqList, liq)
+                if array.size(liqList) > maxLiquidity
+                    LiquidityLevel oldest = array.shift(liqList)
+                    line.delete(oldest.ln)
+                    label.delete(oldest.lbl)
+
+if not na(pl)
+    swL := pl
+    swLBar := bar_index - swingLookback
+    swLBroken := false
+    array.push(swingLows, pl)
+    array.push(swingLowBars, bar_index - swingLookback)
+    if array.size(swingLows) > 20
+        array.shift(swingLows)
+        array.shift(swingLowBars)
+    // Equal-lows liquidity pool check against earlier swing lows
+    if showLiquidity and array.size(swingLows) > 1
+        for i = 0 to array.size(swingLows) - 2
+            float lvl = array.get(swingLows, i)
+            if math.abs(pl - lvl) / lvl * 100 <= eqTolerancePct
+                float avgPrice = (pl + lvl) / 2
+                int startB = array.get(swingLowBars, i)
+                LiquidityLevel liq = LiquidityLevel.new(price=avgPrice, isHigh=false, swept=false, startBar=startB)
+                liq.ln := line.new(startB, avgPrice, bar_index, avgPrice, color=restingLiqColor, style=line.style_dashed)
+                liq.lbl := label.new(bar_index, avgPrice, "EQL", style=label.style_label_left, color=color.new(color.white, 100), textcolor=restingLiqColor, size=size.tiny)
+                array.push(liqList, liq)
+                if array.size(liqList) > maxLiquidity
+                    LiquidityLevel oldest = array.shift(liqList)
+                    line.delete(oldest.ln)
+                    label.delete(oldest.lbl)
+
+// Break detection (confirmed on bar close only)
+bool bullBreak = showStructure and not na(swH) and not swHBroken and close > swH
+bool bearBreak = showStructure and not na(swL) and not swLBroken and close < swL
+
+if bullBreak
+    bool isChoch = trendState == -1
+    trendState := 1
+    swHBroken := true
+    if isChoch
+        chochBullSignal := true
+    else
+        bosBullSignal := true
+    string txt = isChoch ? "CHoCH" : "BOS"
+    color lc = bullStructColor
+    StructureMark mark = StructureMark.new()
+    mark.ln := line.new(swHBar, swH, bar_index, swH, color=lc, style=line.style_dashed, width=1)
+    mark.lbl := label.new(bar_index, swH, txt, style=label.style_label_down, color=color.new(color.white, 100), textcolor=lc, size=size.small)
+    array.push(structMarks, mark)
+    if array.size(structMarks) > MAX_STRUCT_MARKS
+        StructureMark oldest = array.shift(structMarks)
+        line.delete(oldest.ln)
+        label.delete(oldest.lbl)
+    // Order block: last bearish candle before the bullish impulsive break
+    if showOB
+        int lookback = math.max(1, math.min(20, bar_index - nz(swHBar, 0)))
+        [obTop, obBot, obOffset] = f_findLastOppositeCandle(lookback, true)
+        if not na(obOffset)
+            OrderBlock newOB = OrderBlock.new(top=obTop, bottom=obBot, bullish=true, mitigated=false, createdBar=bar_index - obOffset)
+            newOB.b := box.new(bar_index - obOffset, obTop, bar_index + 20, obBot, border_color=bullOBColor, bgcolor=bullOBColor, text="OB")
+            array.push(obList, newOB)
+            newBullOBSignal := true
+            if array.size(obList) > maxOB
+                OrderBlock oldOB = array.shift(obList)
+                box.delete(oldOB.b)
+
+if bearBreak
+    bool isChoch = trendState == 1
+    trendState := -1
+    swLBroken := true
+    if isChoch
+        chochBearSignal := true
+    else
+        bosBearSignal := true
+    string txt = isChoch ? "CHoCH" : "BOS"
+    color lc = bearStructColor
+    StructureMark mark = StructureMark.new()
+    mark.ln := line.new(swLBar, swL, bar_index, swL, color=lc, style=line.style_dashed, width=1)
+    mark.lbl := label.new(bar_index, swL, txt, style=label.style_label_up, color=color.new(color.white, 100), textcolor=lc, size=size.small)
+    array.push(structMarks, mark)
+    if array.size(structMarks) > MAX_STRUCT_MARKS
+        StructureMark oldest = array.shift(structMarks)
+        line.delete(oldest.ln)
+        label.delete(oldest.lbl)
+    // Order block: last bullish candle before the bearish impulsive break
+    if showOB
+        int lookback = math.max(1, math.min(20, bar_index - nz(swLBar, 0)))
+        [obTop, obBot, obOffset] = f_findLastOppositeCandle(lookback, false)
+        if not na(obOffset)
+            OrderBlock newOB = OrderBlock.new(top=obTop, bottom=obBot, bullish=false, mitigated=false, createdBar=bar_index - obOffset)
+            newOB.b := box.new(bar_index - obOffset, obTop, bar_index + 20, obBot, border_color=bearOBColor, bgcolor=bearOBColor, text="OB")
+            array.push(obList, newOB)
+            newBearOBSignal := true
+            if array.size(obList) > maxOB
+                OrderBlock oldOB = array.shift(obList)
+                box.delete(oldOB.b)
+
+// ============================================================================
+// SECTION 2: LIQUIDITY SWEEP DETECTION (wick through, close back inside)
+// ============================================================================
+if showLiquidity and array.size(liqList) > 0
+    for i = 0 to array.size(liqList) - 1
+        LiquidityLevel liq = array.get(liqList, i)
+        if not liq.swept
+            if liq.isHigh and high > liq.price and close < liq.price
+                liq.swept := true
+                line.set_color(liq.ln, sweptLiqColor)
+                line.set_style(liq.ln, line.style_solid)
+                line.set_x2(liq.ln, bar_index)
+                label.set_text(liq.lbl, "Swept")
+                label.set_textcolor(liq.lbl, sweptLiqColor)
+                sweepBullSignal := true
+            else if not liq.isHigh and low < liq.price and close > liq.price
+                liq.swept := true
+                line.set_color(liq.ln, sweptLiqColor)
+                line.set_style(liq.ln, line.style_solid)
+                line.set_x2(liq.ln, bar_index)
+                label.set_text(liq.lbl, "Swept")
+                label.set_textcolor(liq.lbl, sweptLiqColor)
+                sweepBearSignal := true
+            else
+                line.set_x2(liq.ln, bar_index)
+
+// ============================================================================
+// SECTION 3: ORDER BLOCK MITIGATION
+// ============================================================================
+if showOB and array.size(obList) > 0
+    for i = 0 to array.size(obList) - 1
+        OrderBlock ob = array.get(obList, i)
+        if not ob.mitigated
+            float range_ = ob.top - ob.bottom
+            float threshold = ob.bullish ? ob.top - range_ * mitigationPct / 100 : ob.bottom + range_ * mitigationPct / 100
+            bool isMitigated = ob.bullish ? close < threshold : close > threshold
+            if isMitigated
+                ob.mitigated := true
+                box.set_border_color(ob.b, mitigatedOBColor)
+                box.set_bgcolor(ob.b, mitigatedOBColor)
+                box.set_right(ob.b, bar_index)
+            else
+                box.set_right(ob.b, bar_index + 20)
+
+// ============================================================================
+// SECTION 4: FAIR VALUE GAPS (3-candle imbalance)
+// ============================================================================
+bool bullFVG = showFVG and low > high[2]
+bool bearFVG = showFVG and high < low[2]
+
+if bullFVG
+    FVGZone nf = FVGZone.new(top=low, bottom=high[2], bullish=true, filled=false, createdBar=bar_index - 2, filledBar=na)
+    nf.b := box.new(bar_index - 2, low, bar_index + 20, high[2], border_color=bullFVGColor, bgcolor=bullFVGColor, text="FVG")
+    array.push(fvgList, nf)
+    newBullFVGSignal := true
+    if array.size(fvgList) > maxFVG
+        FVGZone oldFVG = array.shift(fvgList)
+        box.delete(oldFVG.b)
+
+if bearFVG
+    FVGZone nf = FVGZone.new(top=low[2], bottom=high, bullish=false, filled=false, createdBar=bar_index - 2, filledBar=na)
+    nf.b := box.new(bar_index - 2, low[2], bar_index + 20, high, border_color=bearFVGColor, bgcolor=bearFVGColor, text="FVG")
+    array.push(fvgList, nf)
+    newBearFVGSignal := true
+    if array.size(fvgList) > maxFVG
+        FVGZone oldFVG = array.shift(fvgList)
+        box.delete(oldFVG.b)
+
+// Fill detection + auto-delete (iterate backward so array.remove is safe)
+if array.size(fvgList) > 0
+    for i = array.size(fvgList) - 1 to 0
+        FVGZone f = array.get(fvgList, i)
+        if not f.filled
+            bool filledNow = f.bullish ? low <= f.bottom : high >= f.top
+            if filledNow
+                f.filled := true
+                f.filledBar := bar_index
+                box.set_border_color(f.b, filledFVGColor)
+                box.set_bgcolor(f.b, filledFVGColor)
+                box.set_right(f.b, bar_index)
+            else
+                box.set_right(f.b, bar_index + 20)
+        else if fvgAutoDelete and not na(f.filledBar) and (bar_index - f.filledBar >= fvgDeleteBars)
+            box.delete(f.b)
+            array.remove(fvgList, i)
+
+// ============================================================================
+// SECTION 5: HIGHER-TIMEFRAME STRUCTURE FILTER
+// ============================================================================
+float htfBiasRaw = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, 20) > ta.ema(close, 50) ? 1.0 : -1.0, lookahead=barmerge.lookahead_off)
+float htfBias = useHTFFilter ? htfBiasRaw : na
+
+// ============================================================================
+// SECTION 6: POINTS OF INTEREST (POI) SYNTHESIS
+// Confluence = base zone (OB or FVG) + overlapping opposite zone type +
+// overlapping swept liquidity. POI zones require confluence >= 2 (i.e. an
+// OB/FVG must line up with at least one other factor) and, if the HTF filter
+// is enabled, must align with the HTF bias.
+// ============================================================================
+if array.size(poiList) > 0
+    for i = 0 to array.size(poiList) - 1
+        POIZone oldPOI = array.get(poiList, i)
+        box.delete(oldPOI.b)
+array.clear(poiList)
+
+if showPOI
+    if array.size(obList) > 0
+        for i = 0 to array.size(obList) - 1
+            OrderBlock ob = array.get(obList, i)
+            if not ob.mitigated
+                bool liqOverlap = false
+                if array.size(liqList) > 0
+                    for j = 0 to array.size(liqList) - 1
+                        LiquidityLevel liq = array.get(liqList, j)
+                        if liq.swept and liq.price <= ob.top and liq.price >= ob.bottom
+                            liqOverlap := true
+                bool fvgOverlap = false
+                if array.size(fvgList) > 0
+                    for j = 0 to array.size(fvgList) - 1
+                        FVGZone f = array.get(fvgList, j)
+                        if not f.filled and f.top >= ob.bottom and f.bottom <= ob.top
+                            fvgOverlap := true
+                int confluence = 1 + (liqOverlap ? 1 : 0) + (fvgOverlap ? 1 : 0)
+                bool htfAligned = not useHTFFilter or na(htfBias) or (ob.bullish and htfBias > 0) or (not ob.bullish and htfBias < 0)
+                if confluence >= 2 and htfAligned
+                    color c = confluence >= 3 ? highConfluenceColor : lowConfluenceColor
+                    POIZone np = POIZone.new(top=ob.top, bottom=ob.bottom, bullish=ob.bullish, confluence=confluence)
+                    np.b := box.new(ob.createdBar, ob.top, bar_index + 10, ob.bottom, border_color=c, bgcolor=c, text="POI x" + str.tostring(confluence))
+                    array.push(poiList, np)
+
+    if array.size(fvgList) > 0
+        for i = 0 to array.size(fvgList) - 1
+            FVGZone f = array.get(fvgList, i)
+            if not f.filled
+                bool liqOverlap = false
+                if array.size(liqList) > 0
+                    for j = 0 to array.size(liqList) - 1
+                        LiquidityLevel liq = array.get(liqList, j)
+                        if liq.swept and liq.price <= f.top and liq.price >= f.bottom
+                            liqOverlap := true
+                if liqOverlap
+                    bool htfAligned = not useHTFFilter or na(htfBias) or (f.bullish and htfBias > 0) or (not f.bullish and htfBias < 0)
+                    if htfAligned
+                        POIZone np = POIZone.new(top=f.top, bottom=f.bottom, bullish=f.bullish, confluence=2)
+                        np.b := box.new(f.createdBar, f.top, bar_index + 10, f.bottom, border_color=lowConfluenceColor, bgcolor=lowConfluenceColor, text="POI x2")
+                        array.push(poiList, np)
+
+// Price-entering-POI alert (edge-triggered so it fires once per entry, not every bar spent inside)
+bool insidePOI = false
+if array.size(poiList) > 0
+    for i = 0 to array.size(poiList) - 1
+        POIZone p = array.get(poiList, i)
+        if close <= p.top and close >= p.bottom
+            insidePOI := true
+var bool prevInsidePOI = false
+priceInPOISignal := insidePOI and not prevInsidePOI
+prevInsidePOI := insidePOI
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(bosBullSignal, title="Bullish BOS", message="Bullish Break of Structure on {{ticker}} ({{interval}})")
+alertcondition(bosBearSignal, title="Bearish BOS", message="Bearish Break of Structure on {{ticker}} ({{interval}})")
+alertcondition(chochBullSignal, title="Bullish CHoCH", message="Bullish Change of Character on {{ticker}} ({{interval}})")
+alertcondition(chochBearSignal, title="Bearish CHoCH", message="Bearish Change of Character on {{ticker}} ({{interval}})")
+alertcondition(newBullOBSignal, title="New Bullish Order Block", message="New bullish (demand) order block formed on {{ticker}} ({{interval}})")
+alertcondition(newBearOBSignal, title="New Bearish Order Block", message="New bearish (supply) order block formed on {{ticker}} ({{interval}})")
+alertcondition(newBullFVGSignal, title="New Bullish FVG", message="New bullish fair value gap formed on {{ticker}} ({{interval}})")
+alertcondition(newBearFVGSignal, title="New Bearish FVG", message="New bearish fair value gap formed on {{ticker}} ({{interval}})")
+alertcondition(sweepBullSignal or sweepBearSignal, title="Liquidity Sweep", message="Liquidity sweep detected on {{ticker}} ({{interval}})")
+alertcondition(priceInPOISignal, title="Price Entered POI", message="Price entered a Point of Interest zone on {{ticker}} ({{interval}})")
