@@ -60,6 +60,7 @@ brokenColor    = input.color(color.new(color.gray, 85), "Broken Zone Color", gro
 lineStyleInput = input.string("Solid", "Proximal/Distal Line Style", options = ["Solid", "Dashed", "Dotted"], group = grpStyle)
 fadeTested     = input.bool(true, "Fade Tested Zones (off = keep colors, flag instead)", group = grpStyle)
 hideBroken     = input.bool(false, "Hide Broken Zones (if not removed)", group = grpStyle)
+onlyShowFresh  = input.bool(true, "Only Show Untouched (Fresh) Zones", group = grpStyle)
 
 grpScore = "Odds Enhancers Score"
 showScore = input.bool(true, "Show Odds Enhancers Score", group = grpScore)
@@ -299,16 +300,18 @@ if barstate.isconfirmed
         for i = 0 to array.size(supplyZones) - 1
             f_checkAndUpdateZone(array.get(supplyZones, i))
 
-    if removeOnBreak
+    // Untouched-only mode strips a zone the instant it's tested (not just
+    // broken) — reuse the same immediate-removal path removeOnBreak uses.
+    if removeOnBreak or onlyShowFresh
         if array.size(demandZones) > 0
             for i = array.size(demandZones) - 1 to 0
                 z = array.get(demandZones, i)
-                if z.state == "broken"
+                if (onlyShowFresh and z.state != "fresh") or (removeOnBreak and z.state == "broken")
                     f_deleteZone(z)
                     array.remove(demandZones, i)
         if array.size(supplyZones) > 0
             for i = array.size(supplyZones) - 1 to 0
                 z = array.get(supplyZones, i)
-                if z.state == "broken"
+                if (onlyShowFresh and z.state != "fresh") or (removeOnBreak and z.state == "broken")
                     f_deleteZone(z)
                     array.remove(supplyZones, i)
