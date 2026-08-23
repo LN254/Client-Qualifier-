@@ -1,0 +1,317 @@
+//@version=6
+// =============================================================================
+// OTA / Sam Seiden Method — Supply & Demand Zone Indicator
+//
+// Zone anatomy: leg-in -> base -> leg-out.
+//   Leg-out UP   -> Demand zone (proximal/distal from the BASE, not the leg-out)
+//   Leg-out DOWN -> Supply zone (proximal/distal from the BASE, not the leg-out)
+// Leg-in direction is not used to classify the zone (DBR/RBR/RBD/DBD tagging
+// is intentionally omitted — only leg-out direction decides demand vs supply).
+//
+// Repaint note: a zone can only be confirmed once its leg-out candle CLOSES,
+// so detection is inherently lagged by one leg-out candle. Once drawn, the
+// box/lines are anchored at the base's historical bar_index and never move
+// retroactively — all state transitions (fresh -> tested -> broken) are
+// evaluated only on barstate.isconfirmed, so the drawn objects themselves do
+// not repaint; you simply see the zone appear a bar later than the base.
+// =============================================================================
+indicator("OTA/Seiden Supply & Demand Zones", shorttitle = "S&D Zones (OTA)", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// =============================================================================
+// TYPES
+// =============================================================================
+type Zone
+    box    zoneBox
+    line   proxLine
+    line   distLine
+    label  scoreLabel
+    bool   isDemand
+    float  proximal
+    float  distal
+    int    startBar
+    int    legOutBar
+    string state       // "fresh" | "tested" | "broken"
+    int    touches
+    float  baseScore
+    float  legScore
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+grpDetect = "Zone Detection"
+atrLength         = input.int(14, "ATR Length", minval = 1, group = grpDetect)
+baseBodyThreshold = input.float(0.35, "Base Body Threshold (× ATR)", minval = 0.01, step = 0.01, group = grpDetect)
+legOutThreshold   = input.float(1.3, "Leg-Out Body Threshold (× ATR)", minval = 0.1, step = 0.05, group = grpDetect)
+legOutWickMax     = input.float(0.35, "Leg-Out Opposite Wick Max (× body)", minval = 0.0, step = 0.05, group = grpDetect)
+minBaseCandles    = input.int(1, "Min Base Candles", minval = 1, group = grpDetect)
+maxBaseCandles    = input.int(6, "Max Base Candles", minval = 1, group = grpDetect)
+
+grpMgmt = "Zone Management"
+maxActiveZones    = input.int(20, "Max Active Zones (per side)", minval = 1, group = grpMgmt)
+removeOnBreak     = input.bool(true, "Remove Zone on Break (else gray out)", group = grpMgmt)
+extendUntilBroken = input.bool(true, "Extend Until Broken (else fixed bars forward)", group = grpMgmt)
+extendBars        = input.int(50, "Fixed Extend Bars (if not extend-until-broken)", minval = 1, group = grpMgmt)
+
+grpStyle = "Appearance"
+demandColor    = input.color(color.new(color.blue, 70), "Demand Zone Color", group = grpStyle)
+supplyColor    = input.color(color.new(color.red, 70), "Supply Zone Color", group = grpStyle)
+testedColor    = input.color(color.new(color.gray, 60), "Tested Zone Color", group = grpStyle)
+brokenColor    = input.color(color.new(color.gray, 85), "Broken Zone Color", group = grpStyle)
+lineStyleInput = input.string("Solid", "Proximal/Distal Line Style", options = ["Solid", "Dashed", "Dotted"], group = grpStyle)
+fadeTested     = input.bool(true, "Fade Tested Zones (off = keep colors, flag instead)", group = grpStyle)
+hideBroken     = input.bool(false, "Hide Broken Zones (if not removed)", group = grpStyle)
+onlyShowFresh  = input.bool(true, "Only Show Untouched (Fresh) Zones", group = grpStyle)
+
+grpScore = "Odds Enhancers Score"
+showScore = input.bool(true, "Show Odds Enhancers Score", group = grpScore)
+
+lineStyleVal = lineStyleInput == "Dashed" ? line.style_dashed : lineStyleInput == "Dotted" ? line.style_dotted : line.style_solid
+
+// =============================================================================
+// STATE — active zones + running base-candidate accumulator
+// =============================================================================
+var array<Zone> demandZones = array.new<Zone>()
+var array<Zone> supplyZones = array.new<Zone>()
+
+var int   baseStart      = na   // bar_index of first candle in the current base candidate
+var int   baseCount      = 0    // number of consecutive base candles accumulated so far
+var int   lastBaseBar    = na   // bar_index of the most recent base candle
+var float baseBodySum    = na   // running sum of base-candle bodies (for the Odds Enhancers score)
+var float baseProxDemand = na   // running max(open, close) across the base -> demand proximal
+var float baseDistDemand = na   // running min(low)          across the base -> demand distal
+var float baseProxSupply = na   // running min(open, close)  across the base -> supply proximal
+var float baseDistSupply = na   // running max(high)         across the base -> supply distal
+
+// =============================================================================
+// DETECTION HELPERS
+// =============================================================================
+atrVal = ta.atr(atrLength)
+body   = math.abs(close - open)
+isBaseCandle = body <= baseBodyThreshold * atrVal
+isBullish    = close > open
+isBearish    = close < open
+
+// "Opposite wick" = the wick on the side AGAINST the leg-out's direction of
+// travel (i.e. the wick that would represent hesitation/rejection before the
+// breakout). For a bullish leg-out (demand) that's the lower wick; for a
+// bearish leg-out (supply) that's the upper wick. Keeping this small confirms
+// the candle drove straight out of the base with conviction.
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+
+isLegOutUp   = isBullish and body >= legOutThreshold * atrVal and lowerWick <= legOutWickMax * body
+isLegOutDown = isBearish and body >= legOutThreshold * atrVal and upperWick <= legOutWickMax * body
+
+// =============================================================================
+// SCORE HELPERS (Odds Enhancers — additive, isolated from core detection)
+// =============================================================================
+calcBaseScore(avgBodyRatio, candles) =>
+    tightness    = math.max(0.0, math.min(1.0, 1.0 - avgBodyRatio / baseBodyThreshold))
+    candleFactor = math.max(0.0, math.min(1.0, (maxBaseCandles - candles + 1) / float(maxBaseCandles)))
+    100.0 * (0.5 * tightness + 0.5 * candleFactor)
+
+calcLegScore(bodyRatio) =>
+    100.0 * math.min(1.0, bodyRatio / (legOutThreshold * 2.0))
+
+// =============================================================================
+// ZONE MANAGEMENT HELPERS
+// =============================================================================
+f_zonesOverlap(isDemand, distal, proximal) =>
+    lo = math.min(distal, proximal)
+    hi = math.max(distal, proximal)
+    arr = isDemand ? demandZones : supplyZones
+    found = false
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            z = array.get(arr, i)
+            if z.state != "broken"
+                zlo = math.min(z.distal, z.proximal)
+                zhi = math.max(z.distal, z.proximal)
+                if hi >= zlo and lo <= zhi
+                    found := true
+    found
+
+f_deleteZone(z) =>
+    box.delete(z.zoneBox)
+    line.delete(z.proxLine)
+    line.delete(z.distLine)
+    if not na(z.scoreLabel)
+        label.delete(z.scoreLabel)
+
+f_pruneZones(arr) =>
+    // Prefer pruning already-broken zones first, then fall back to oldest.
+    if array.size(arr) > maxActiveZones
+        i = 0
+        while array.size(arr) > maxActiveZones and i < array.size(arr)
+            z = array.get(arr, i)
+            if z.state == "broken"
+                f_deleteZone(z)
+                array.remove(arr, i)
+            else
+                i += 1
+    if array.size(arr) > maxActiveZones
+        while array.size(arr) > maxActiveZones
+            zOld = array.get(arr, 0)
+            f_deleteZone(zOld)
+            array.remove(arr, 0)
+
+f_refreshScoreLabel(z) =>
+    if showScore and not na(z.scoreLabel)
+        freshness = math.max(0.0, 100.0 - z.touches * 20.0)
+        total = math.round((z.baseScore + z.legScore + freshness) / 3.0)
+        label.set_text(z.scoreLabel, "S&D " + str.tostring(total, "#") + "%")
+
+f_applyState(z) =>
+    baseColor = z.isDemand ? demandColor : supplyColor
+    if z.state == "fresh"
+        box.set_border_color(z.zoneBox, color.new(baseColor, 0))
+        box.set_bgcolor(z.zoneBox, baseColor)
+        line.set_color(z.proxLine, color.new(baseColor, 0))
+        line.set_color(z.distLine, color.new(baseColor, 0))
+    else if z.state == "tested"
+        c = fadeTested ? testedColor : baseColor
+        box.set_border_color(z.zoneBox, color.new(c, fadeTested ? 30 : 0))
+        box.set_bgcolor(z.zoneBox, fadeTested ? color.new(c, 85) : baseColor)
+        line.set_color(z.proxLine, color.new(c, fadeTested ? 30 : 0))
+        line.set_color(z.distLine, color.new(c, fadeTested ? 30 : 0))
+    else if z.state == "broken"
+        c = hideBroken ? color.new(brokenColor, 100) : brokenColor
+        box.set_border_color(z.zoneBox, c)
+        box.set_bgcolor(z.zoneBox, c)
+        line.set_color(z.proxLine, c)
+        line.set_color(z.distLine, c)
+
+// =============================================================================
+// ALERTS — JSON payloads ready for a TradingView webhook -> n8n flow
+// =============================================================================
+f_alert(z, event) =>
+    msg = '{"event":"' + event + '","type":"' + (z.isDemand ? "demand" : "supply") + '","symbol":"{{ticker}}","tf":"{{interval}}","proximal":' + str.tostring(z.proximal, format.mintick) + ',"distal":' + str.tostring(z.distal, format.mintick) + ',"time":"{{time}}"}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+// =============================================================================
+// ZONE CREATION
+// =============================================================================
+f_createZone(isDemand, proximal, distal, startBar, legOutBar, bodyRatio, baseCandles, avgBodyRatio) =>
+    zoneColor  = isDemand ? demandColor : supplyColor
+    rightEdge  = extendUntilBroken ? legOutBar : legOutBar + extendBars
+    extendMode = extendUntilBroken ? extend.right : extend.none
+
+    zBox = box.new(left = startBar, top = math.max(proximal, distal), right = rightEdge, bottom = math.min(proximal, distal), border_color = color.new(zoneColor, 0), bgcolor = zoneColor, extend = extendMode, xloc = xloc.bar_index)
+    pLine = line.new(x1 = startBar, y1 = proximal, x2 = rightEdge, y2 = proximal, extend = extendMode, color = color.new(zoneColor, 0), style = lineStyleVal, xloc = xloc.bar_index)
+    dLine = line.new(x1 = startBar, y1 = distal, x2 = rightEdge, y2 = distal, extend = extendMode, color = color.new(zoneColor, 0), style = lineStyleVal, xloc = xloc.bar_index)
+
+    baseScore = calcBaseScore(avgBodyRatio, baseCandles)
+    legScore  = calcLegScore(bodyRatio)
+
+    label lbl = na
+    if showScore
+        total = math.round((baseScore + legScore + 100.0) / 3.0)
+        lbl := label.new(x = legOutBar, y = proximal, text = "S&D " + str.tostring(total, "#") + "%", xloc = xloc.bar_index, style = isDemand ? label.style_label_up : label.style_label_down, color = color.new(zoneColor, 20), textcolor = color.white, size = size.tiny)
+
+    z = Zone.new(zoneBox = zBox, proxLine = pLine, distLine = dLine, scoreLabel = lbl, isDemand = isDemand, proximal = proximal, distal = distal, startBar = startBar, legOutBar = legOutBar, state = "fresh", touches = 0, baseScore = baseScore, legScore = legScore)
+
+    arr = isDemand ? demandZones : supplyZones
+    array.push(arr, z)
+    f_pruneZones(arr)
+    f_alert(z, "zone_formed")
+
+// =============================================================================
+// PER-ZONE TEST / BREAK EVALUATION
+// =============================================================================
+f_checkAndUpdateZone(z) =>
+    // Skip the zone's own formation bar — the leg-out candle's wick dipping
+    // back into the base is not a "test", only later price action counts.
+    if z.state != "broken" and bar_index > z.legOutBar
+        brokenNow  = z.isDemand ? close < z.distal : close > z.distal
+        enteredNow = z.isDemand ? low <= z.proximal : high >= z.proximal
+
+        if brokenNow
+            z.state := "broken"
+        else if enteredNow
+            wasFresh = z.state == "fresh"
+            z.state := "tested"
+            z.touches += 1
+            f_refreshScoreLabel(z)
+            if wasFresh
+                f_alert(z, "zone_tested")
+
+        if z.state == "broken"
+            if extendUntilBroken
+                box.set_extend(z.zoneBox, extend.none)
+                box.set_right(z.zoneBox, bar_index)
+                line.set_extend(z.proxLine, extend.none)
+                line.set_x2(z.proxLine, bar_index)
+                line.set_extend(z.distLine, extend.none)
+                line.set_x2(z.distLine, bar_index)
+            f_alert(z, "zone_broken")
+
+        f_applyState(z)
+
+// =============================================================================
+// MAIN — runs once per confirmed (closed) bar only, so drawn objects never
+// repaint intrabar. This block is O(1) for detection + O(active zones) for
+// state updates — never a full-history scan.
+// =============================================================================
+if barstate.isconfirmed
+    if isBaseCandle
+        if baseCount == 0
+            baseStart := bar_index
+            baseCount := 1
+            baseBodySum := body
+            baseProxDemand := math.max(open, close)
+            baseDistDemand := low
+            baseProxSupply := math.min(open, close)
+            baseDistSupply := high
+        else if baseCount < maxBaseCandles
+            baseCount += 1
+            baseBodySum += body
+            baseProxDemand := math.max(baseProxDemand, math.max(open, close))
+            baseDistDemand := math.min(baseDistDemand, low)
+            baseProxSupply := math.min(baseProxSupply, math.min(open, close))
+            baseDistSupply := math.max(baseDistSupply, high)
+        else
+            baseStart := bar_index
+            baseCount := 1
+            baseBodySum := body
+            baseProxDemand := math.max(open, close)
+            baseDistDemand := low
+            baseProxSupply := math.min(open, close)
+            baseDistSupply := high
+        lastBaseBar := bar_index
+    else
+        haveValidBase = baseCount >= minBaseCandles and not na(lastBaseBar) and lastBaseBar == bar_index - 1
+        if haveValidBase and (isLegOutUp or isLegOutDown)
+            demandSide    = isLegOutUp
+            zoneProximal  = demandSide ? baseProxDemand : baseProxSupply
+            zoneDistal    = demandSide ? baseDistDemand : baseDistSupply
+            avgBodyRatio  = (baseBodySum / baseCount) / atrVal
+            bodyRatio     = body / atrVal
+            if not f_zonesOverlap(demandSide, zoneDistal, zoneProximal)
+                f_createZone(demandSide, zoneProximal, zoneDistal, baseStart, bar_index, bodyRatio, baseCount, avgBodyRatio)
+        baseCount := 0
+        baseStart := na
+        lastBaseBar := na
+        baseBodySum := na
+
+    if array.size(demandZones) > 0
+        for i = 0 to array.size(demandZones) - 1
+            f_checkAndUpdateZone(array.get(demandZones, i))
+    if array.size(supplyZones) > 0
+        for i = 0 to array.size(supplyZones) - 1
+            f_checkAndUpdateZone(array.get(supplyZones, i))
+
+    // Untouched-only mode strips a zone the instant it's tested (not just
+    // broken) — reuse the same immediate-removal path removeOnBreak uses.
+    if removeOnBreak or onlyShowFresh
+        if array.size(demandZones) > 0
+            for i = array.size(demandZones) - 1 to 0
+                z = array.get(demandZones, i)
+                if (onlyShowFresh and z.state != "fresh") or (removeOnBreak and z.state == "broken")
+                    f_deleteZone(z)
+                    array.remove(demandZones, i)
+        if array.size(supplyZones) > 0
+            for i = array.size(supplyZones) - 1 to 0
+                z = array.get(supplyZones, i)
+                if (onlyShowFresh and z.state != "fresh") or (removeOnBreak and z.state == "broken")
+                    f_deleteZone(z)
+                    array.remove(supplyZones, i)
