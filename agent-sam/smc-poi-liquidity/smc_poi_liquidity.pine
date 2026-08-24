@@ -1,0 +1,395 @@
+//@version=6
+indicator("Agent Sam — SMC/ICT POI + Liquidity Layer", shorttitle="Sam-SMC", overlay=true, max_boxes_count=200, max_lines_count=200, max_labels_count=200)
+
+// =====================================================================================
+// Parallel layer to the Seiden OTA/Drop-Base-Rally engine. Same host (Agent Sam), same
+// alert pipeline (TradingView webhook -> n8n). Instead of Seiden's freshness/departure
+// strength score, this qualifies a POI with a structure break (HTF) confirmed by a
+// liquidity sweep (LTF), and emits a binary confluence gate rather than a 0-100 score.
+// =====================================================================================
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+htf_input      = input.timeframe("240", "HTF (Structure / POI)", group = "Timeframes")
+ltf_input      = input.timeframe("15",  "LTF (Liquidity Sweep)", group = "Timeframes")
+
+pivotLen       = input.int(5,  "HTF Pivot Lookback", minval = 1, group = "Structure")
+rangeLookback  = input.int(20, "Ranging Lookback (HTF bars w/o BOS/CHoCH)", minval = 1, group = "Structure")
+
+poiModeInput   = input.string("both", "POI Mode", options = ["orderblock", "fvg", "both"], group = "POI")
+useWicks       = input.bool(true, "Use Wicks for Zone (else Open/Close)", group = "POI")
+
+liqPivotLen    = input.int(5, "LTF Liquidity Pivot Lookback", minval = 1, group = "Liquidity")
+sweepMaxBars   = input.int(3, "Sweep Max Bars to Close Back Inside", minval = 1, group = "Liquidity")
+
+alertEveryBar  = input.bool(true, "Fire Alert on Every Confirmed LTF Bar (informational log for backtesting)", group = "Alerts")
+
+showStructure  = input.bool(true, "Show Structure Lines", group = "Visuals")
+showPOI        = input.bool(true, "Show POI Zones", group = "Visuals")
+showSweep      = input.bool(true, "Show Liquidity Sweep Markers", group = "Visuals")
+bullColor      = input.color(color.new(color.teal, 70),   "Bullish POI Color", group = "Visuals")
+bearColor      = input.color(color.new(color.maroon, 70), "Bearish POI Color", group = "Visuals")
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+var array<float> hO = array.new<float>()
+var array<float> hH = array.new<float>()
+var array<float> hL = array.new<float>()
+var array<float> hC = array.new<float>()
+var array<int>   hT = array.new<int>()
+MAX_HTF_BARS = 300
+
+var float swingHigh    = na
+var int   swingHighIdx = na
+var float swingLow     = na
+var int   swingLowIdx  = na
+var string trend       = "ranging"   // bullish / bearish / ranging
+var int   barsSinceEvent = 0
+
+var float bullPOIHigh  = na
+var float bullPOILow   = na
+var string bullPOIType = na
+var string bullPOIState = "none"     // active / tapped / invalidated / none
+var bool  bullPOITapped = false
+
+var float bearPOIHigh  = na
+var float bearPOILow   = na
+var string bearPOIType = na
+var string bearPOIState = "none"
+var bool  bearPOITapped = false
+
+var float ltfSwingHigh = na
+var float ltfSwingLow  = na
+
+var bool  awaitingBear = false
+var float bearSweepLevel = na
+var int   bearSweepBars  = 0
+var bool  awaitingBull = false
+var float bullSweepLevel = na
+var int   bullSweepBars  = 0
+
+var bool  liquiditySweptBull = false
+var bool  liquiditySweptBear = false
+var float sweepPriceBull = na
+var float sweepPriceBear = na
+var int   sweepTimeBull  = na
+var int   sweepTimeBear  = na
+
+var box  bullBox = na
+var box  bearBox = na
+var line swingHighLine = na
+var line swingLowLine  = na
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+overlaps(loA, hiA, loB, hiB) =>
+    hiA >= loB and loA <= hiB
+
+// Finds the POI for the impulsive leg [startIdx .. endIdx] in the rolling HTF arrays.
+// poiMode "both": prefer the first FVG inside the leg (tighter entry); fall back to the
+// order-block anchor candle if no FVG formed. This resolves an ambiguity the source
+// material didn't specify (see spec Notes).
+buildPOI(bullishLeg, startIdx, endIdx) =>
+    float poiHi = na
+    float poiLo = na
+    string poiType = na
+    bool found = false
+
+    if endIdx - startIdx >= 2 and (poiModeInput == "fvg" or poiModeInput == "both")
+        for i = startIdx + 1 to endIdx - 1
+            float h1 = array.get(hH, i - 1)
+            float l1 = array.get(hL, i - 1)
+            float h3 = array.get(hH, i + 1)
+            float l3 = array.get(hL, i + 1)
+            if bullishLeg and h1 < l3
+                poiHi := l3
+                poiLo := h1
+                poiType := "fvg"
+                found := true
+                break
+            if not bullishLeg and l1 > h3
+                poiHi := l1
+                poiLo := h3
+                poiType := "fvg"
+                found := true
+                break
+
+    if not found and endIdx > startIdx and (poiModeInput == "orderblock" or poiModeInput == "both")
+        int anchorIdx = na
+        // Anchor = last opposite-colored candle immediately before the impulsive leg's
+        // final push. Falls back to the swing pivot candle itself when the whole leg is
+        // one color (source material didn't cover this case either — ICT convention default).
+        for i = endIdx - 1 to startIdx
+            float o = array.get(hO, i)
+            float c = array.get(hC, i)
+            if bullishLeg and c < o
+                anchorIdx := i
+                break
+            if not bullishLeg and c > o
+                anchorIdx := i
+                break
+        if na(anchorIdx)
+            anchorIdx := startIdx
+        float aO = array.get(hO, anchorIdx)
+        float aH = array.get(hH, anchorIdx)
+        float aL = array.get(hL, anchorIdx)
+        float aC = array.get(hC, anchorIdx)
+        if useWicks
+            poiHi := aH
+            poiLo := aL
+        else
+            poiHi := math.max(aO, aC)
+            poiLo := math.min(aO, aC)
+        poiType := "orderblock"
+        found := true
+
+    [poiHi, poiLo, poiType, found]
+
+// ---------------------------------------------------------------------------
+// HTF structure / POI feed (single request.security call, confirmed-bar gated)
+// ---------------------------------------------------------------------------
+[htfO, htfH, htfL, htfC, htfT, htfConfirmed, htfPivotHi, htfPivotLo] = request.security(
+     syminfo.tickerid, htf_input,
+     [open, high, low, close, time, barstate.isconfirmed,
+      ta.pivothigh(high, pivotLen, pivotLen), ta.pivotlow(low, pivotLen, pivotLen)],
+     lookahead = barmerge.lookahead_off)
+
+// ---------------------------------------------------------------------------
+// LTF liquidity feed (single request.security call)
+// ---------------------------------------------------------------------------
+[ltfH_, ltfL_, ltfC_, ltfT_, ltfConfirmed, ltfPivotHi, ltfPivotLo] = request.security(
+     syminfo.tickerid, ltf_input,
+     [high, low, close, time, barstate.isconfirmed,
+      ta.pivothigh(high, liqPivotLen, liqPivotLen), ta.pivotlow(low, liqPivotLen, liqPivotLen)],
+     lookahead = barmerge.lookahead_off)
+
+// ---------------------------------------------------------------------------
+// HTF: roll bars, detect pivots, BOS/CHoCH, build/invalidate POIs
+// ---------------------------------------------------------------------------
+if htfConfirmed
+    array.push(hO, htfO)
+    array.push(hH, htfH)
+    array.push(hL, htfL)
+    array.push(hC, htfC)
+    array.push(hT, htfT)
+    if array.size(hO) > MAX_HTF_BARS
+        array.shift(hO)
+        array.shift(hH)
+        array.shift(hL)
+        array.shift(hC)
+        array.shift(hT)
+
+    n = array.size(hH)
+
+    if not na(htfPivotHi) and n >= pivotLen + 1
+        idx = n - 1 - pivotLen
+        swingHigh := array.get(hH, idx)
+        swingHighIdx := idx
+        if showStructure
+            if not na(swingHighLine)
+                line.delete(swingHighLine)
+            swingHighLine := line.new(bar_index, swingHigh, bar_index + 1, swingHigh, xloc.bar_index, extend.right, color.new(color.red, 40))
+
+    if not na(htfPivotLo) and n >= pivotLen + 1
+        idx2 = n - 1 - pivotLen
+        swingLow := array.get(hL, idx2)
+        swingLowIdx := idx2
+        if showStructure
+            if not na(swingLowLine)
+                line.delete(swingLowLine)
+            swingLowLine := line.new(bar_index, swingLow, bar_index + 1, swingLow, xloc.bar_index, extend.right, color.new(color.lime, 40))
+
+    barsSinceEvent += 1
+
+    bool brokeUp   = not na(swingHigh) and htfC > swingHigh
+    bool brokeDown = not na(swingLow)  and htfC < swingLow
+
+    if brokeUp
+        trend := "bullish"
+        barsSinceEvent := 0
+        if not na(swingLowIdx) and n - 1 > swingLowIdx
+            [bHi, bLo, bType, bFound] = buildPOI(true, swingLowIdx, n - 1)
+            if bFound
+                bullPOIHigh := bHi
+                bullPOILow := bLo
+                bullPOIType := bType
+                bullPOIState := "active"
+                bullPOITapped := false
+                liquiditySweptBull := false
+                awaitingBull := false
+                if showPOI
+                    if not na(bullBox)
+                        box.delete(bullBox)
+                    bullBox := box.new(bar_index, bHi, bar_index + 1, bLo, border_color = color.new(color.teal, 0), bgcolor = bullColor, extend = extend.right)
+        if not na(swingHighLine)
+            line.delete(swingHighLine)
+            swingHighLine := na
+        swingHigh := na
+
+    if brokeDown
+        trend := "bearish"
+        barsSinceEvent := 0
+        if not na(swingHighIdx) and n - 1 > swingHighIdx
+            [bHi2, bLo2, bType2, bFound2] = buildPOI(false, swingHighIdx, n - 1)
+            if bFound2
+                bearPOIHigh := bHi2
+                bearPOILow := bLo2
+                bearPOIType := bType2
+                bearPOIState := "active"
+                bearPOITapped := false
+                liquiditySweptBear := false
+                awaitingBear := false
+                if showPOI
+                    if not na(bearBox)
+                        box.delete(bearBox)
+                    bearBox := box.new(bar_index, bHi2, bar_index + 1, bLo2, border_color = color.new(color.maroon, 0), bgcolor = bearColor, extend = extend.right)
+        if not na(swingLowLine)
+            line.delete(swingLowLine)
+            swingLowLine := na
+        swingLow := na
+
+    if barsSinceEvent > rangeLookback
+        trend := "ranging"
+
+    // Invalidation: HTF close fully through the zone. Wick-through alone does not
+    // invalidate (spec explicitly calls this out); applies whether or not it was tapped.
+    if bullPOIState == "active" or bullPOIState == "tapped"
+        if htfC < bullPOILow
+            bullPOIState := "invalidated"
+            if not na(bullBox)
+                box.delete(bullBox)
+                bullBox := na
+    if bearPOIState == "active" or bearPOIState == "tapped"
+        if htfC > bearPOIHigh
+            bearPOIState := "invalidated"
+            if not na(bearBox)
+                box.delete(bearBox)
+                bearBox := na
+
+// ---------------------------------------------------------------------------
+// POI tap detection (LTF price, live) — must precede liquidity sweep logic
+// ---------------------------------------------------------------------------
+if bullPOIState == "active" and not na(bullPOIHigh) and overlaps(ltfL_, ltfH_, bullPOILow, bullPOIHigh)
+    bullPOITapped := true
+    bullPOIState := "tapped"
+if bearPOIState == "active" and not na(bearPOIHigh) and overlaps(ltfL_, ltfH_, bearPOILow, bearPOIHigh)
+    bearPOITapped := true
+    bearPOIState := "tapped"
+
+// ---------------------------------------------------------------------------
+// LTF: liquidity pivots + sweep state machine (gated on confirmed LTF bar close)
+// ---------------------------------------------------------------------------
+bool sweepJustBull = false
+bool sweepJustBear = false
+
+if ltfConfirmed
+    if not na(ltfPivotHi)
+        ltfSwingHigh := ltfPivotHi
+    if not na(ltfPivotLo)
+        ltfSwingLow := ltfPivotLo
+
+    // Bearish sweep: stop-run through a resting high sitting at/above the bearish POI.
+    if awaitingBear
+        bearSweepBars += 1
+        if ltfC_ < bearSweepLevel
+            liquiditySweptBear := true
+            sweepPriceBear := ltfH_
+            sweepTimeBear := ltfT_
+            awaitingBear := false
+            sweepJustBear := true
+        else if bearSweepBars >= sweepMaxBars
+            awaitingBear := false
+
+    if not awaitingBear and (bearPOIState == "active" or bearPOIState == "tapped") and not na(ltfSwingHigh)
+        if ltfSwingHigh >= bearPOILow and ltfH_ > ltfSwingHigh and overlaps(ltfL_, ltfH_, bearPOILow, bearPOIHigh)
+            awaitingBear := true
+            bearSweepLevel := ltfSwingHigh
+            bearSweepBars := 0
+
+    // Bullish sweep: stop-run through a resting low sitting at/below the bullish POI.
+    if awaitingBull
+        bullSweepBars += 1
+        if ltfC_ > bullSweepLevel
+            liquiditySweptBull := true
+            sweepPriceBull := ltfL_
+            sweepTimeBull := ltfT_
+            awaitingBull := false
+            sweepJustBull := true
+        else if bullSweepBars >= sweepMaxBars
+            awaitingBull := false
+
+    if not awaitingBull and (bullPOIState == "active" or bullPOIState == "tapped") and not na(ltfSwingLow)
+        if ltfSwingLow <= bullPOIHigh and ltfL_ < ltfSwingLow and overlaps(ltfL_, ltfH_, bullPOILow, bullPOIHigh)
+            awaitingBull := true
+            bullSweepLevel := ltfSwingLow
+            bullSweepBars := 0
+
+// ---------------------------------------------------------------------------
+// Confluence gate
+// ---------------------------------------------------------------------------
+bullGate = trend == "bullish" and (bullPOIState == "active" or bullPOIState == "tapped") and liquiditySweptBull
+bearGate = trend == "bearish" and (bearPOIState == "active" or bearPOIState == "tapped") and liquiditySweptBear
+smc_signal_valid = bullGate or bearGate
+
+// Pick the side to report: whichever gate fired, else whatever matches current structure bias.
+string outDirection = na
+float  outPoiHigh = na
+float  outPoiLow = na
+string outPoiType = na
+bool   outSwept = false
+float  outSweepPrice = na
+
+if bullGate or trend == "bullish"
+    outDirection := "bullish"
+    outPoiHigh := bullPOIHigh
+    outPoiLow := bullPOILow
+    outPoiType := bullPOIType
+    outSwept := liquiditySweptBull
+    outSweepPrice := sweepPriceBull
+else if bearGate or trend == "bearish"
+    outDirection := "bearish"
+    outPoiHigh := bearPOIHigh
+    outPoiLow := bearPOILow
+    outPoiType := bearPOIType
+    outSwept := liquiditySweptBear
+    outSweepPrice := sweepPriceBear
+
+// ---------------------------------------------------------------------------
+// Visuals — sweep markers
+// ---------------------------------------------------------------------------
+if showSweep and sweepJustBull
+    label.new(bar_index, ltfL_, "SWEEP", style = label.style_triangleup, color = color.new(color.green, 0), textcolor = color.white, size = size.tiny, yloc = yloc.belowbar)
+if showSweep and sweepJustBear
+    label.new(bar_index, ltfH_, "SWEEP", style = label.style_triangledown, color = color.new(color.red, 0), textcolor = color.white, size = size.tiny, yloc = yloc.abovebar)
+
+// ---------------------------------------------------------------------------
+// Alert payload — merge under an "smc" key alongside Seiden's payload in n8n.
+// {{ticker}} / {{time}} are TradingView placeholders resolved at alert-fire time.
+// ---------------------------------------------------------------------------
+jsonPayload() =>
+    '{"layer":"smc_poi_liquidity","symbol":"{{ticker}}","htf":"' + htf_input + '","ltf":"' + ltf_input +
+     '","structure_bias":"' + trend +
+     '","poi_type":"' + (na(outPoiType) ? "" : outPoiType) +
+     '","poi_high":' + (na(outPoiHigh) ? "null" : str.tostring(outPoiHigh, format.mintick)) +
+     ',"poi_low":' + (na(outPoiLow) ? "null" : str.tostring(outPoiLow, format.mintick)) +
+     ',"poi_direction":"' + (na(outDirection) ? "" : outDirection) +
+     '","liquidity_swept":' + (outSwept ? "true" : "false") +
+     ',"sweep_price":' + (na(outSweepPrice) ? "null" : str.tostring(outSweepPrice, format.mintick)) +
+     ',"smc_signal_valid":' + (smc_signal_valid ? "true" : "false") +
+     ',"bar_time":"{{time}}"}'
+
+if ltfConfirmed and (smc_signal_valid or alertEveryBar)
+    alert(jsonPayload(), alert.freq_once_per_bar_close)
+
+alertcondition(bullGate, title = "Sam-SMC Bullish Signal", message = "Agent Sam SMC: bullish POI swept, structure aligned.")
+alertcondition(bearGate, title = "Sam-SMC Bearish Signal", message = "Agent Sam SMC: bearish POI swept, structure aligned.")
+
+// ---------------------------------------------------------------------------
+// Plots for external reference (e.g. Strategy Tester / other indicators)
+// ---------------------------------------------------------------------------
+plot(smc_signal_valid ? 1 : 0, title = "smc_signal_valid", display = display.data_window)
+plotchar(bullGate, title = "Bull Gate", char = "▲", location = location.belowbar, color = color.green, display = display.data_window)
+plotchar(bearGate, title = "Bear Gate", char = "▼", location = location.abovebar, color = color.red, display = display.data_window)
