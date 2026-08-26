@@ -1,0 +1,562 @@
+//@version=6
+indicator("Smart Money Trading Plan", shorttitle = "SMTP", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+grpStruct = "Market Structure"
+swingLookback   = input.int(5, "Swing Lookback (bars each side)", minval = 1, group = grpStruct)
+showStructure   = input.bool(true, "Show Structure (BOS / Range)", group = grpStruct)
+
+grpFVG = "Fair Value Gaps"
+showFVG       = input.bool(true, "Show FVG", group = grpFVG)
+maxActiveFVGs = input.int(20, "Max Active FVGs", minval = 1, group = grpFVG)
+
+grpLiq = "Liquidity"
+showLiquidity       = input.bool(true, "Show Liquidity", group = grpLiq)
+eqTolerancePct      = input.float(0.1, "Equal High/Low Tolerance %", minval = 0.0, step = 0.01, group = grpLiq)
+maxActiveLiquidity  = input.int(30, "Max Active Swing/EQ Liquidity Levels", minval = 1, group = grpLiq)
+showDailyLevels     = input.bool(true, "Show Prior Daily High/Low", group = grpLiq)
+
+grpZone = "Supply / Demand Zones"
+showZones           = input.bool(true, "Show Zones", group = grpZone)
+pushMultiplier      = input.float(2.0, "Push Multiplier (x origin candle range)", minval = 0.1, group = grpZone)
+zoneMaxAgeBars       = input.int(500, "Zone Max Age (bars)", minval = 10, group = grpZone)
+maxActiveZones       = input.int(20, "Max Active Zones", minval = 1, group = grpZone)
+displacementAtrLen   = input.int(14, "Displacement ATR Length", minval = 1, group = grpZone)
+displacementAtrMult  = input.float(1.5, "Displacement ATR Multiplier", minval = 0.1, group = grpZone)
+pushTrackBars        = input.int(20, "Bars to Resolve Zone Quality Score", minval = 1, group = grpZone)
+
+grpEntry = "Entry & Management"
+showEntries         = input.bool(true, "Show Entry Annotations", group = grpEntry)
+sweepLookbackBars   = input.int(30, "Liquidity Sweep Lookback for Entry", minval = 1, group = grpEntry)
+stopBufferAtrMult   = input.float(0.25, "Stop Buffer (x ATR)", minval = 0.0, group = grpEntry)
+
+grpAlert = "Alerts"
+enableAlerts = input.bool(true, "Enable Alerts", group = grpAlert)
+
+// ============================================================================
+// COLORS
+// ============================================================================
+colBullLine     = color.new(color.teal, 0)
+colBearLine     = color.new(color.red, 0)
+colFVGBull      = color.new(color.teal, 80)
+colFVGBear      = color.new(color.red, 80)
+colZoneDemand   = color.new(color.blue, 85)
+colZoneDemandHQ = color.new(color.blue, 55)
+colZoneSupply   = color.new(color.purple, 85)
+colZoneSupplyHQ = color.new(color.purple, 55)
+colSubZone      = color.new(color.yellow, 40)
+colLiquidity    = color.new(color.orange, 30)
+colEqual        = color.new(color.aqua, 20)
+colTurning      = color.new(color.yellow, 10)
+colDaily        = color.new(color.gray, 30)
+colSweep        = color.new(color.fuchsia, 0)
+colEntryLong    = color.new(color.lime, 0)
+colEntryShort   = color.new(color.red, 0)
+
+// ============================================================================
+// TYPES
+// ============================================================================
+type Pivot
+    float price
+    int   barIndex
+    bool  isHigh
+    bool  broken   = false
+    bool  swept    = false
+    bool  isTurning = false
+    bool  isEqual  = false
+    line  lvlLine  = na
+    label lvlLabel = na
+
+type FVG
+    box   fvgBox
+    bool  isBull
+    float top
+    float bottom
+    float origTop
+    float origBottom
+    int   createdBar
+    bool  mitigated = false
+
+type Zone
+    box    zoneBox
+    box    subBox
+    label  infoLabel
+    bool   isDemand
+    float  top
+    float  bottom
+    float  originRange
+    int    createdBar
+    int    score          = 0
+    bool   hasInefficiency = false
+    bool   hasStructure    = false
+    bool   hasPush         = false
+    bool   highQuality     = false
+    bool   qualityAnnounced = false
+    bool   invalidated     = false
+    bool   entryFired      = false
+    float  maxExcursion    = 0.0
+    bool   pushResolved    = false
+    FVG    relatedFvg
+
+// ============================================================================
+// STATE
+// ============================================================================
+var array<Pivot> pivotHighs = array.new<Pivot>()
+var array<Pivot> pivotLows  = array.new<Pivot>()
+var array<FVG>   fvgs       = array.new<FVG>()
+var array<Zone>  zones      = array.new<Zone>()
+
+var string bias = "ranging"
+
+var float rangeLow    = na
+var float rangeHigh   = na
+var int   rangeLowBar  = na
+var int   rangeHighBar = na
+var box   rangeBox    = na
+var label rangeLabel  = na
+
+var float dayHigh      = na
+var float dayLow       = na
+var line  dayHighLine  = na
+var line  dayLowLine   = na
+var label dayHighLabel = na
+var label dayLowLabel  = na
+var bool  dayHighSwept = false
+var bool  dayLowSwept  = false
+
+var int lastLowSweepBar  = na
+var int lastHighSweepBar = na
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+f_alertMsg(_event, _zscore, _ztop, _zbottom) =>
+    '{"event":"' + _event + '","symbol":"{{ticker}}","timeframe":"{{interval}}","bias":"' + bias +
+     '","zone_score":' + str.tostring(_zscore) + ',"zone_top":' + str.tostring(_ztop) +
+     ',"zone_bottom":' + str.tostring(_zbottom) + ',"time":"{{timenow}}"}'
+
+f_fireAlert(_event, _zscore, _ztop, _zbottom) =>
+    if enableAlerts
+        alert(f_alertMsg(_event, _zscore, _ztop, _zbottom), alert.freq_once_per_bar_close)
+
+f_prunePivots(arr, maxSize) =>
+    // drop oldest pivots beyond the cap, deleting their drawings so object counts stay bounded
+    while array.size(arr) > maxSize
+        old = array.shift(arr)
+        if not na(old.lvlLine)
+            line.delete(old.lvlLine)
+        if not na(old.lvlLabel)
+            label.delete(old.lvlLabel)
+
+f_pruneFvgs(arr, maxSize) =>
+    while array.size(arr) > maxSize
+        old = array.shift(arr)
+        if not na(old.fvgBox)
+            box.delete(old.fvgBox)
+
+f_pruneZones(arr, maxSize) =>
+    while array.size(arr) > maxSize
+        old = array.shift(arr)
+        if not na(old.zoneBox)
+            box.delete(old.zoneBox)
+        if not na(old.subBox)
+            box.delete(old.subBox)
+        if not na(old.infoLabel)
+            label.delete(old.infoLabel)
+
+// ============================================================================
+// SECURITY (prior completed daily high/low - non-repainting)
+// ============================================================================
+[pdHigh, pdLow] = request.security(syminfo.tickerid, "1D", [high[1], low[1]], lookahead = barmerge.lookahead_off)
+
+// ============================================================================
+// CORE SERIES
+// ============================================================================
+atrVal = ta.atr(displacementAtrLen)
+ph = ta.pivothigh(swingLookback, swingLookback)
+pl = ta.pivotlow(swingLookback, swingLookback)
+isNewDay = ta.change(time("D")) != 0
+
+// ============================================================================
+// MAIN (confirmed bars only -> non-repainting)
+// ============================================================================
+if barstate.isconfirmed
+
+    // ---------------- Daily liquidity ----------------
+    if showDailyLevels and isNewDay and not na(pdHigh)
+        if not na(dayHighLine)
+            line.delete(dayHighLine)
+            label.delete(dayHighLabel)
+        if not na(dayLowLine)
+            line.delete(dayLowLine)
+            label.delete(dayLowLabel)
+        dayHigh := pdHigh
+        dayLow  := pdLow
+        dayHighSwept := false
+        dayLowSwept  := false
+        dayHighLine  := line.new(bar_index, dayHigh, bar_index, dayHigh, xloc.bar_index, extend.right, colDaily, line.style_dashed, 1)
+        dayLowLine   := line.new(bar_index, dayLow, bar_index, dayLow, xloc.bar_index, extend.right, colDaily, line.style_dashed, 1)
+        dayHighLabel := label.new(bar_index, dayHigh, "PDH", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_left, colDaily, size.tiny)
+        dayLowLabel  := label.new(bar_index, dayLow, "PDL", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_left, colDaily, size.tiny)
+
+    if showLiquidity and not na(dayHighLine)
+        if not dayHighSwept and high > dayHigh and close < dayHigh
+            dayHighSwept := true
+            line.set_color(dayHighLine, colSweep)
+            label.new(bar_index, dayHigh, "Sweep", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_down, colSweep, size.tiny)
+            lastHighSweepBar := bar_index
+            f_fireAlert("liquidity_sweep", 0, 0.0, 0.0)
+        if not dayLowSwept and low < dayLow and close > dayLow
+            dayLowSwept := true
+            line.set_color(dayLowLine, colSweep)
+            label.new(bar_index, dayLow, "Sweep", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_up, colSweep, size.tiny)
+            lastLowSweepBar := bar_index
+            f_fireAlert("liquidity_sweep", 0, 0.0, 0.0)
+
+    // ---------------- Pivots / swing liquidity / equal highs-lows ----------------
+    if not na(ph)
+        newPH = Pivot.new(price = ph, barIndex = bar_index - swingLookback, isHigh = true)
+        if array.size(pivotHighs) > 0
+            for i = 0 to array.size(pivotHighs) - 1
+                p = array.get(pivotHighs, i)
+                if not p.broken and math.abs(newPH.price - p.price) / p.price * 100 <= eqTolerancePct
+                    p.isEqual := true
+                    newPH.isEqual := true
+                    if showLiquidity and not na(p.lvlLine)
+                        line.set_color(p.lvlLine, colEqual)
+        if showLiquidity
+            lblTxt = newPH.isEqual ? "EQH" : "Swing High"
+            newPH.lvlLine  := line.new(newPH.barIndex, newPH.price, bar_index, newPH.price, xloc.bar_index, extend.right, newPH.isEqual ? colEqual : colLiquidity, line.style_dotted, 1)
+            newPH.lvlLabel := label.new(newPH.barIndex, newPH.price, lblTxt, xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_down, colLiquidity, size.tiny)
+        array.push(pivotHighs, newPH)
+        f_prunePivots(pivotHighs, maxActiveLiquidity)
+
+    if not na(pl)
+        newPL = Pivot.new(price = pl, barIndex = bar_index - swingLookback, isHigh = false)
+        if array.size(pivotLows) > 0
+            for i = 0 to array.size(pivotLows) - 1
+                p = array.get(pivotLows, i)
+                if not p.broken and math.abs(newPL.price - p.price) / p.price * 100 <= eqTolerancePct
+                    p.isEqual := true
+                    newPL.isEqual := true
+                    if showLiquidity and not na(p.lvlLine)
+                        line.set_color(p.lvlLine, colEqual)
+        if showLiquidity
+            lblTxt = newPL.isEqual ? "EQL" : "Swing Low"
+            newPL.lvlLine  := line.new(newPL.barIndex, newPL.price, bar_index, newPL.price, xloc.bar_index, extend.right, newPL.isEqual ? colEqual : colLiquidity, line.style_dotted, 1)
+            newPL.lvlLabel := label.new(newPL.barIndex, newPL.price, lblTxt, xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_up, colLiquidity, size.tiny)
+        array.push(pivotLows, newPL)
+        f_prunePivots(pivotLows, maxActiveLiquidity)
+
+    // ---------------- Liquidity sweeps on swing/EQ levels ----------------
+    if showLiquidity
+        if array.size(pivotHighs) > 0
+            for i = 0 to array.size(pivotHighs) - 1
+                p = array.get(pivotHighs, i)
+                if not p.broken and not p.swept and high > p.price and close < p.price
+                    p.swept := true
+                    if not na(p.lvlLine)
+                        line.set_color(p.lvlLine, colSweep)
+                        line.set_extend(p.lvlLine, extend.none)
+                        line.set_x2(p.lvlLine, bar_index)
+                    label.new(bar_index, p.price, "Sweep", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_down, colSweep, size.tiny)
+                    lastHighSweepBar := bar_index
+                    f_fireAlert("liquidity_sweep", 0, 0.0, 0.0)
+        if array.size(pivotLows) > 0
+            for i = 0 to array.size(pivotLows) - 1
+                p = array.get(pivotLows, i)
+                if not p.broken and not p.swept and low < p.price and close > p.price
+                    p.swept := true
+                    if not na(p.lvlLine)
+                        line.set_color(p.lvlLine, colSweep)
+                        line.set_extend(p.lvlLine, extend.none)
+                        line.set_x2(p.lvlLine, bar_index)
+                    label.new(bar_index, p.price, "Sweep", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_up, colSweep, size.tiny)
+                    lastLowSweepBar := bar_index
+                    f_fireAlert("liquidity_sweep", 0, 0.0, 0.0)
+
+    // ---------------- Market structure: BOS + trading range ----------------
+    Pivot lastPH = na
+    if array.size(pivotHighs) > 0
+        for i = array.size(pivotHighs) - 1 to 0
+            p = array.get(pivotHighs, i)
+            if not p.broken
+                lastPH := p
+                break
+
+    Pivot lastPL = na
+    if array.size(pivotLows) > 0
+        for i = array.size(pivotLows) - 1 to 0
+            p = array.get(pivotLows, i)
+            if not p.broken
+                lastPL := p
+                break
+
+    bosThisBar = false
+    bosBull = false
+
+    if not na(lastPH) and close > lastPH.price
+        lastPH.broken := true
+        if not na(lastPH.lvlLine)
+            line.set_extend(lastPH.lvlLine, extend.none)
+            line.set_x2(lastPH.lvlLine, bar_index)
+        line.new(lastPH.barIndex, lastPH.price, bar_index, lastPH.price, xloc.bar_index, extend.none, colBullLine, line.style_solid, 2)
+        label.new(bar_index, lastPH.price, "Bos", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_down, colBullLine, size.small)
+        bias := "bullish"
+        bosThisBar := true
+        bosBull := true
+        if not na(lastPL)
+            lastPL.isTurning := true
+            if not na(lastPL.lvlLine)
+                line.set_width(lastPL.lvlLine, 2)
+                line.set_color(lastPL.lvlLine, colTurning)
+            rangeLow := lastPL.price
+            rangeLowBar := lastPL.barIndex
+        rangeHigh := high
+        rangeHighBar := bar_index
+        f_fireAlert("bos", 0, 0.0, 0.0)
+
+    else if not na(lastPL) and close < lastPL.price
+        lastPL.broken := true
+        if not na(lastPL.lvlLine)
+            line.set_extend(lastPL.lvlLine, extend.none)
+            line.set_x2(lastPL.lvlLine, bar_index)
+        line.new(lastPL.barIndex, lastPL.price, bar_index, lastPL.price, xloc.bar_index, extend.none, colBearLine, line.style_solid, 2)
+        label.new(bar_index, lastPL.price, "Bos", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_up, colBearLine, size.small)
+        bias := "bearish"
+        bosThisBar := true
+        bosBull := false
+        if not na(lastPH)
+            lastPH.isTurning := true
+            if not na(lastPH.lvlLine)
+                line.set_width(lastPH.lvlLine, 2)
+                line.set_color(lastPH.lvlLine, colTurning)
+            rangeHigh := lastPH.price
+            rangeHighBar := lastPH.barIndex
+        rangeLow := low
+        rangeLowBar := bar_index
+        f_fireAlert("bos", 0, 0.0, 0.0)
+
+    else
+        if bias == "bullish" and not na(rangeHigh)
+            rangeHigh := math.max(rangeHigh, high)
+        if bias == "bearish" and not na(rangeLow)
+            rangeLow := math.min(rangeLow, low)
+
+    if showStructure and not na(rangeLow) and not na(rangeHigh)
+        if bosThisBar or na(rangeBox)
+            if not na(rangeBox)
+                box.delete(rangeBox)
+                label.delete(rangeLabel)
+            rangeBox := box.new(rangeLowBar, rangeHigh, bar_index, rangeLow, color.new(color.gray, 100), 1, line.style_dashed, extend.none, xloc.bar_index, color.new(color.gray, 92))
+            rangeLabel := label.new(bar_index, rangeHigh, "Range (" + bias + ")", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_down, color.gray, size.tiny)
+        else
+            box.set_right(rangeBox, bar_index)
+            box.set_top(rangeBox, rangeHigh)
+            box.set_bottom(rangeBox, rangeLow)
+            label.set_xy(rangeLabel, bar_index, rangeHigh)
+
+    // ---------------- Fair Value Gaps ----------------
+    if showFVG
+        if low > high[2]
+            fv = FVG.new(isBull = true, top = low, bottom = high[2], origTop = low, origBottom = high[2], createdBar = bar_index)
+            fv.fvgBox := box.new(bar_index - 2, fv.top, bar_index, fv.bottom, color.new(color.teal, 100), 1, line.style_solid, extend.none, xloc.bar_index, colFVGBull, "FVG")
+            array.push(fvgs, fv)
+        if high < low[2]
+            fv = FVG.new(isBull = false, top = low[2], bottom = high, origTop = low[2], origBottom = high, createdBar = bar_index)
+            fv.fvgBox := box.new(bar_index - 2, fv.top, bar_index, fv.bottom, color.new(color.red, 100), 1, line.style_solid, extend.none, xloc.bar_index, colFVGBear, "FVG")
+            array.push(fvgs, fv)
+
+        if array.size(fvgs) > 0
+            for i = array.size(fvgs) - 1 to 0
+                fv = array.get(fvgs, i)
+                if not fv.mitigated
+                    box.set_right(fv.fvgBox, bar_index)
+                    if fv.isBull
+                        if low <= fv.bottom
+                            fv.mitigated := true
+                        else if low < fv.top
+                            fv.top := low
+                            box.set_top(fv.fvgBox, fv.top)
+                    else
+                        if high >= fv.top
+                            fv.mitigated := true
+                        else if high > fv.bottom
+                            fv.bottom := high
+                            box.set_bottom(fv.fvgBox, fv.bottom)
+                    if bar_index - fv.createdBar > zoneMaxAgeBars
+                        fv.mitigated := true
+                if fv.mitigated
+                    box.delete(fv.fvgBox)
+                    array.remove(fvgs, i)
+        f_pruneFvgs(fvgs, maxActiveFVGs)
+
+    // ---------------- Supply & Demand zones ----------------
+    if showZones
+        // displacement detection
+        dispRange = high - low
+        isDisplacement = dispRange > displacementAtrMult * atrVal
+        isBullCandle = close > open
+        isBearCandle = close < open
+
+        if isDisplacement and isBullCandle
+            int off = 1
+            for n = 1 to 5
+                if close[n] < open[n]
+                    off := n
+                    break
+            oHigh = high[off]
+            oLow  = low[off]
+            oRange = oHigh - oLow
+            if oRange > 0
+                z = Zone.new(isDemand = true, top = oHigh, bottom = oLow, originRange = oRange, createdBar = bar_index - off)
+                z.zoneBox := box.new(bar_index - off, z.top, bar_index, z.bottom, color.new(color.blue, 100), 1, line.style_solid, extend.right, xloc.bar_index, colZoneDemand, "Demand")
+                array.push(zones, z)
+
+        if isDisplacement and isBearCandle
+            int off = 1
+            for n = 1 to 5
+                if close[n] > open[n]
+                    off := n
+                    break
+            oHigh = high[off]
+            oLow  = low[off]
+            oRange = oHigh - oLow
+            if oRange > 0
+                z = Zone.new(isDemand = false, top = oHigh, bottom = oLow, originRange = oRange, createdBar = bar_index - off)
+                z.zoneBox := box.new(bar_index - off, z.top, bar_index, z.bottom, color.new(color.purple, 100), 1, line.style_solid, extend.right, xloc.bar_index, colZoneSupply, "Supply")
+                array.push(zones, z)
+
+        f_pruneZones(zones, maxActiveZones)
+
+        // update / score / invalidate existing zones
+        if array.size(zones) > 0
+            for i = array.size(zones) - 1 to 0
+                z = array.get(zones, i)
+                age = bar_index - z.createdBar
+
+                if not z.invalidated
+                    // invalidation: full candle close through the zone
+                    if z.isDemand and close < z.bottom
+                        z.invalidated := true
+                    if not z.isDemand and close > z.top
+                        z.invalidated := true
+
+                if not z.invalidated and age <= pushTrackBars
+                    // 1) inefficiency: a matching-direction FVG appears adjacent to / inside this zone
+                    if not z.hasInefficiency and array.size(fvgs) > 0
+                        for j = 0 to array.size(fvgs) - 1
+                            fv = array.get(fvgs, j)
+                            if fv.isBull == z.isDemand and fv.createdBar >= z.createdBar
+                                overlaps = z.isDemand ? fv.origBottom <= z.top + z.originRange : fv.origTop >= z.bottom - z.originRange
+                                if overlaps
+                                    z.hasInefficiency := true
+                                    z.relatedFvg := fv
+                                    break
+
+                    // 2) structure: the leg away from the zone produces a matching BOS
+                    if not z.hasStructure and bosThisBar and bosBull == z.isDemand
+                        z.hasStructure := true
+
+                    // 3) pushed distance: track max favorable excursion, resolve on first opposing pivot
+                    if not z.pushResolved
+                        if z.isDemand
+                            z.maxExcursion := math.max(z.maxExcursion, high - z.top)
+                            if not na(pl) and (bar_index - swingLookback) > z.createdBar
+                                z.hasPush := z.maxExcursion >= pushMultiplier * z.originRange
+                                z.pushResolved := true
+                        else
+                            z.maxExcursion := math.max(z.maxExcursion, z.bottom - low)
+                            if not na(ph) and (bar_index - swingLookback) > z.createdBar
+                                z.hasPush := z.maxExcursion >= pushMultiplier * z.originRange
+                                z.pushResolved := true
+
+                    if age == pushTrackBars and not z.pushResolved
+                        // window closed without an opposing pivot; grade on excursion so far
+                        z.hasPush := z.maxExcursion >= pushMultiplier * z.originRange
+                        z.pushResolved := true
+
+                    z.score := (z.hasInefficiency ? 1 : 0) + (z.hasStructure ? 1 : 0) + (z.hasPush ? 1 : 0)
+
+                    if age >= pushTrackBars and not z.qualityAnnounced
+                        z.qualityAnnounced := true
+                        if z.score == 3
+                            z.highQuality := true
+                            box.set_border_color(z.zoneBox, z.isDemand ? colZoneDemandHQ : colZoneSupplyHQ)
+                            box.set_border_width(z.zoneBox, 3)
+                            box.set_bgcolor(z.zoneBox, z.isDemand ? colZoneDemandHQ : colZoneSupplyHQ)
+                            z.infoLabel := label.new(z.createdBar, z.isDemand ? z.bottom : z.top, "HQ Zone " + str.tostring(z.score) + "/3",
+                                 xloc.bar_index, yloc.price, color.new(color.white, 100), z.isDemand ? label.style_label_up : label.style_label_down,
+                                 z.isDemand ? colZoneDemandHQ : colZoneSupplyHQ, size.tiny)
+                            if not na(z.relatedFvg)
+                                subTop = math.min(z.top, z.relatedFvg.origTop)
+                                subBottom = math.max(z.bottom, z.relatedFvg.origBottom)
+                                if subTop > subBottom
+                                    z.subBox := box.new(z.createdBar, subTop, bar_index, subBottom, color.new(color.yellow, 60), 2, line.style_solid, extend.right, xloc.bar_index, colSubZone, "Entry FVG")
+                            f_fireAlert("zone_high_quality", z.score, z.top, z.bottom)
+
+                if not z.invalidated and bar_index - z.createdBar > zoneMaxAgeBars
+                    z.invalidated := true
+
+                if z.invalidated
+                    box.delete(z.zoneBox)
+                    if not na(z.subBox)
+                        box.delete(z.subBox)
+                    if not na(z.infoLabel)
+                        label.delete(z.infoLabel)
+                    array.remove(zones, i)
+                else
+                    box.set_right(z.zoneBox, bar_index)
+                    if not na(z.subBox)
+                        box.set_right(z.subBox, bar_index)
+
+    // ---------------- Entry & management annotations ----------------
+    if showEntries and array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            z = array.get(zones, i)
+            if z.highQuality and not z.invalidated and not z.entryFired and not na(z.subBox)
+                matchBias = (z.isDemand and bias == "bullish") or (not z.isDemand and bias == "bearish")
+                if matchBias
+                    subTop = box.get_top(z.subBox)
+                    subBottom = box.get_bottom(z.subBox)
+                    priceInSub = low <= subTop and high >= subBottom
+                    if priceInSub
+                        recentSweep = z.isDemand ? (not na(lastLowSweepBar) and bar_index - lastLowSweepBar <= sweepLookbackBars) :
+                                                     (not na(lastHighSweepBar) and bar_index - lastHighSweepBar <= sweepLookbackBars)
+
+                        stopPrice = z.isDemand ? z.bottom - stopBufferAtrMult * atrVal : z.top + stopBufferAtrMult * atrVal
+
+                        float targetPrice = na
+                        if z.isDemand
+                            if array.size(pivotHighs) > 0
+                                for k = array.size(pivotHighs) - 1 to 0
+                                    p = array.get(pivotHighs, k)
+                                    if not p.broken and p.price > close
+                                        targetPrice := p.price
+                                        break
+                        else
+                            if array.size(pivotLows) > 0
+                                for k = array.size(pivotLows) - 1 to 0
+                                    p = array.get(pivotLows, k)
+                                    if not p.broken and p.price < close
+                                        targetPrice := p.price
+                                        break
+
+                        z.entryFired := true
+                        entryTxt = (z.isDemand ? "Long Entry" : "Short Entry") + (recentSweep ? " (sweep confirmed)" : "") +
+                             "\nStop: " + str.tostring(stopPrice, format.mintick) +
+                             "\nTarget: " + (na(targetPrice) ? "n/a" : str.tostring(targetPrice, format.mintick))
+                        label.new(bar_index, z.isDemand ? subBottom : subTop, entryTxt, xloc.bar_index, yloc.price,
+                             color.new(color.white, 100), z.isDemand ? label.style_label_up : label.style_label_down,
+                             z.isDemand ? colEntryLong : colEntryShort, size.small)
+                        f_fireAlert("zone_entry", z.score, z.top, z.bottom)
+
+// ============================================================================
+// BIAS DASHBOARD
+// ============================================================================
+var table dash = table.new(position.top_right, 1, 1, border_width = 1)
+if barstate.islast
+    biasColor = bias == "bullish" ? colBullLine : bias == "bearish" ? colBearLine : color.gray
+    table.cell(dash, 0, 0, "Bias: " + str.upper(bias), text_color = color.white, bgcolor = biasColor)
