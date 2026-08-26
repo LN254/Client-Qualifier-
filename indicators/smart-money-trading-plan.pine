@@ -7,16 +7,26 @@ indicator("Smart Money Trading Plan", shorttitle = "SMTP", overlay = true, max_b
 grpStruct = "Market Structure"
 swingLookback   = input.int(5, "Swing Lookback (bars each side)", minval = 1, group = grpStruct)
 showStructure   = input.bool(true, "Show Structure (BOS / Range)", group = grpStruct)
+colBullLine     = input.color(color.new(color.teal, 0), "Bullish BOS / Range Color", group = grpStruct)
+colBearLine     = input.color(color.new(color.red, 0), "Bearish BOS / Range Color", group = grpStruct)
+colRange        = input.color(color.new(color.gray, 92), "Trading Range Fill", group = grpStruct)
 
 grpFVG = "Fair Value Gaps"
 showFVG       = input.bool(true, "Show FVG", group = grpFVG)
 maxActiveFVGs = input.int(20, "Max Active FVGs", minval = 1, group = grpFVG)
+colFVGBull    = input.color(color.new(color.teal, 80), "Bullish FVG Color", group = grpFVG)
+colFVGBear    = input.color(color.new(color.red, 80), "Bearish FVG Color", group = grpFVG)
 
 grpLiq = "Liquidity"
 showLiquidity       = input.bool(true, "Show Liquidity", group = grpLiq)
 eqTolerancePct      = input.float(0.1, "Equal High/Low Tolerance %", minval = 0.0, step = 0.01, group = grpLiq)
 maxActiveLiquidity  = input.int(30, "Max Active Swing/EQ Liquidity Levels", minval = 1, group = grpLiq)
 showDailyLevels     = input.bool(true, "Show Prior Daily High/Low", group = grpLiq)
+colLiquidity        = input.color(color.new(color.orange, 30), "Swing High/Low Color", group = grpLiq)
+colEqual            = input.color(color.new(color.aqua, 20), "Equal High/Low Color", group = grpLiq)
+colTurning          = input.color(color.new(color.yellow, 10), "Turning Point Color", group = grpLiq)
+colDaily            = input.color(color.new(color.gray, 30), "Daily High/Low Color", group = grpLiq)
+colSweep            = input.color(color.new(color.fuchsia, 0), "Liquidity Sweep Color", group = grpLiq)
 
 grpZone = "Supply / Demand Zones"
 showZones           = input.bool(true, "Show Zones", group = grpZone)
@@ -26,34 +36,21 @@ maxActiveZones       = input.int(20, "Max Active Zones", minval = 1, group = grp
 displacementAtrLen   = input.int(14, "Displacement ATR Length", minval = 1, group = grpZone)
 displacementAtrMult  = input.float(1.5, "Displacement ATR Multiplier", minval = 0.1, group = grpZone)
 pushTrackBars        = input.int(20, "Bars to Resolve Zone Quality Score", minval = 1, group = grpZone)
+colZoneDemand        = input.color(color.new(color.blue, 85), "Demand Zone Color", group = grpZone)
+colZoneDemandHQ      = input.color(color.new(color.blue, 55), "High Quality Demand Zone Color", group = grpZone)
+colZoneSupply        = input.color(color.new(color.purple, 85), "Supply Zone Color", group = grpZone)
+colZoneSupplyHQ      = input.color(color.new(color.purple, 55), "High Quality Supply Zone Color", group = grpZone)
+colSubZone           = input.color(color.new(color.yellow, 40), "Refined Entry Sub-zone Color", group = grpZone)
 
 grpEntry = "Entry & Management"
 showEntries         = input.bool(true, "Show Entry Annotations", group = grpEntry)
 sweepLookbackBars   = input.int(30, "Liquidity Sweep Lookback for Entry", minval = 1, group = grpEntry)
 stopBufferAtrMult   = input.float(0.25, "Stop Buffer (x ATR)", minval = 0.0, group = grpEntry)
+colEntryLong        = input.color(color.new(color.lime, 0), "Long Entry Color", group = grpEntry)
+colEntryShort       = input.color(color.new(color.red, 0), "Short Entry Color", group = grpEntry)
 
 grpAlert = "Alerts"
 enableAlerts = input.bool(true, "Enable Alerts", group = grpAlert)
-
-// ============================================================================
-// COLORS
-// ============================================================================
-colBullLine     = color.new(color.teal, 0)
-colBearLine     = color.new(color.red, 0)
-colFVGBull      = color.new(color.teal, 80)
-colFVGBear      = color.new(color.red, 80)
-colZoneDemand   = color.new(color.blue, 85)
-colZoneDemandHQ = color.new(color.blue, 55)
-colZoneSupply   = color.new(color.purple, 85)
-colZoneSupplyHQ = color.new(color.purple, 55)
-colSubZone      = color.new(color.yellow, 40)
-colLiquidity    = color.new(color.orange, 30)
-colEqual        = color.new(color.aqua, 20)
-colTurning      = color.new(color.yellow, 10)
-colDaily        = color.new(color.gray, 30)
-colSweep        = color.new(color.fuchsia, 0)
-colEntryLong    = color.new(color.lime, 0)
-colEntryShort   = color.new(color.red, 0)
 
 // ============================================================================
 // TYPES
@@ -350,8 +347,9 @@ if barstate.isconfirmed
             if not na(rangeBox)
                 box.delete(rangeBox)
                 label.delete(rangeLabel)
-            rangeBox := box.new(rangeLowBar, rangeHigh, bar_index, rangeLow, color.new(color.gray, 100), 1, line.style_dashed, extend.none, xloc.bar_index, color.new(color.gray, 92))
-            rangeLabel := label.new(bar_index, rangeHigh, "Range (" + bias + ")", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_down, color.gray, size.tiny)
+            rangeBorderCol = bias == "bullish" ? colBullLine : bias == "bearish" ? colBearLine : color.gray
+            rangeBox := box.new(rangeLowBar, rangeHigh, bar_index, rangeLow, rangeBorderCol, 1, line.style_dashed, extend.none, xloc.bar_index, colRange)
+            rangeLabel := label.new(bar_index, rangeHigh, "Range (" + bias + ")", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_down, rangeBorderCol, size.tiny)
         else
             box.set_right(rangeBox, bar_index)
             box.set_top(rangeBox, rangeHigh)
