@@ -50,8 +50,8 @@ colEntryLong        = input.color(color.new(color.lime, 0), "Long Entry Color", 
 colEntryShort       = input.color(color.new(color.red, 0), "Short Entry Color", group = grpEntry)
 
 grpVP = "Volume Profile"
-showVolumeProfile = input.bool(true, "Show Volume Profile", group = grpVP)
-vpLookbackBars    = input.int(200, "Lookback (bars)", minval = 10, maxval = 2000, group = grpVP)
+showVolumeProfile = input.bool(true, "Show Volume Profile (anchored to last leg)", group = grpVP)
+vpMaxLegBars      = input.int(300, "Max Leg Length Used (bars)", minval = 10, maxval = 2000, group = grpVP)
 vpRows            = input.int(24, "Rows", minval = 5, maxval = 100, group = grpVP)
 vpValueAreaPct    = input.float(70.0, "Value Area %", minval = 1.0, maxval = 100.0, group = grpVP)
 vpWidthBars       = input.int(50, "Max Profile Width (bars)", minval = 5, maxval = 300, group = grpVP)
@@ -181,6 +181,90 @@ f_pruneZones(arr, maxSize) =>
             box.delete(old.subBox)
         if not na(old.infoLabel)
             label.delete(old.infoLabel)
+
+// Builds a volume profile over the just-completed structural leg (legStartBar -> bar_index),
+// replacing whatever profile is currently drawn. POC/VAH/VAL lines then project forward with
+// extend.right so they read as support/resistance against later price action (e.g. a later FVG).
+f_buildVolumeProfile(legStartBar) =>
+    if not na(legStartBar)
+        legLen = math.min(bar_index - legStartBar + 1, vpMaxLegBars)
+        if legLen > 1
+            if array.size(vpBoxes) > 0
+                for i = 0 to array.size(vpBoxes) - 1
+                    box.delete(array.get(vpBoxes, i))
+                array.clear(vpBoxes)
+            if not na(vpPocLine)
+                line.delete(vpPocLine)
+                line.delete(vpVahLine)
+                line.delete(vpValLine)
+                label.delete(vpPocLabel)
+                label.delete(vpVahLabel)
+                label.delete(vpValLabel)
+
+            priceHigh = ta.highest(high, legLen)
+            priceLow  = ta.lowest(low, legLen)
+            binSize = (priceHigh - priceLow) / vpRows
+
+            if binSize > 0
+                volArray = array.new_float(vpRows, 0.0)
+                for k = 0 to legLen - 1
+                    bH = high[k]
+                    bL = low[k]
+                    bV = volume[k]
+                    bRange = bH - bL
+                    for i = 0 to vpRows - 1
+                        binLow  = priceLow + i * binSize
+                        binHigh = binLow + binSize
+                        if bRange > 0
+                            ov = math.min(bH, binHigh) - math.max(bL, binLow)
+                            if ov > 0
+                                array.set(volArray, i, array.get(volArray, i) + bV * (ov / bRange))
+                        else if bH >= binLow and bH <= binHigh
+                            array.set(volArray, i, array.get(volArray, i) + bV)
+
+                pocIdx = array.indexof(volArray, array.max(volArray))
+                maxVol = array.get(volArray, pocIdx)
+                totalVol = array.sum(volArray)
+
+                int   vaLowIdx    = pocIdx
+                int   vaHighIdx   = pocIdx
+                float accumulated = maxVol
+                targetVol = totalVol * vpValueAreaPct / 100
+                while accumulated < targetVol and (vaLowIdx > 0 or vaHighIdx < vpRows - 1)
+                    canUp = vaHighIdx < vpRows - 1
+                    canDown = vaLowIdx > 0
+                    volAbove = canUp ? array.get(volArray, vaHighIdx + 1) : -1.0
+                    volBelow = canDown ? array.get(volArray, vaLowIdx - 1) : -1.0
+                    if canUp and (not canDown or volAbove >= volBelow)
+                        vaHighIdx += 1
+                        accumulated += volAbove
+                    else
+                        vaLowIdx -= 1
+                        accumulated += volBelow
+
+                xLeft = legStartBar
+                for i = 0 to vpRows - 1
+                    binLow  = priceLow + i * binSize
+                    binHigh = binLow + binSize
+                    vol = array.get(volArray, i)
+                    w = maxVol > 0 ? math.round(vpWidthBars * vol / maxVol) : 0
+                    inVA = i >= vaLowIdx and i <= vaHighIdx
+                    barColor = i == pocIdx ? colPOC : (inVA ? colVPBarVA : colVPBar)
+                    if w > 0
+                        newBox = box.new(xLeft, binHigh, xLeft + int(w), binLow, color.new(color.black, 100), 1, line.style_solid, extend.none, xloc.bar_index, barColor)
+                        array.push(vpBoxes, newBox)
+
+                pocPrice = priceLow + (pocIdx + 0.5) * binSize
+                vahPrice = priceLow + (vaHighIdx + 1) * binSize
+                valPrice = priceLow + vaLowIdx * binSize
+
+                vpPocLine := line.new(xLeft, pocPrice, bar_index, pocPrice, xloc.bar_index, extend.right, colPOC, line.style_solid, 2)
+                vpVahLine := line.new(xLeft, vahPrice, bar_index, vahPrice, xloc.bar_index, extend.right, colValueArea, line.style_dashed, 1)
+                vpValLine := line.new(xLeft, valPrice, bar_index, valPrice, xloc.bar_index, extend.right, colValueArea, line.style_dashed, 1)
+
+                vpPocLabel := label.new(xLeft, pocPrice, "POC", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_right, colPOC, size.tiny)
+                vpVahLabel := label.new(xLeft, vahPrice, "VAH", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_right, colValueArea, size.tiny)
+                vpValLabel := label.new(xLeft, valPrice, "VAL", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_right, colValueArea, size.tiny)
 
 // ============================================================================
 // SECURITY (prior completed daily high/low - non-repainting)
@@ -312,6 +396,8 @@ if barstate.isconfirmed
 
     bosThisBar = false
     bosBull = false
+    prevRangeLowBar  = rangeLowBar
+    prevRangeHighBar = rangeHighBar
 
     if not na(lastPH) and close > lastPH.price
         lastPH.broken := true
@@ -333,6 +419,8 @@ if barstate.isconfirmed
         rangeHigh := high
         rangeHighBar := bar_index
         f_fireAlert("bos", 0, 0.0, 0.0)
+        if showVolumeProfile
+            f_buildVolumeProfile(prevRangeLowBar)
 
     else if not na(lastPL) and close < lastPL.price
         lastPL.broken := true
@@ -354,6 +442,8 @@ if barstate.isconfirmed
         rangeLow := low
         rangeLowBar := bar_index
         f_fireAlert("bos", 0, 0.0, 0.0)
+        if showVolumeProfile
+            f_buildVolumeProfile(prevRangeHighBar)
 
     else
         if bias == "bullish" and not na(rangeHigh)
@@ -569,87 +659,6 @@ if barstate.isconfirmed
                              color.new(color.white, 100), z.isDemand ? label.style_label_up : label.style_label_down,
                              z.isDemand ? colEntryLong : colEntryShort, size.small)
                         f_fireAlert("zone_entry", z.score, z.top, z.bottom)
-
-// ============================================================================
-// VOLUME PROFILE (recomputed only on the last bar - not a bar-by-bar signal)
-// ============================================================================
-if showVolumeProfile and barstate.islast
-    if array.size(vpBoxes) > 0
-        for i = 0 to array.size(vpBoxes) - 1
-            box.delete(array.get(vpBoxes, i))
-        array.clear(vpBoxes)
-    if not na(vpPocLine)
-        line.delete(vpPocLine)
-        line.delete(vpVahLine)
-        line.delete(vpValLine)
-        label.delete(vpPocLabel)
-        label.delete(vpVahLabel)
-        label.delete(vpValLabel)
-
-    priceHigh = ta.highest(high, vpLookbackBars)
-    priceLow  = ta.lowest(low, vpLookbackBars)
-    binSize = (priceHigh - priceLow) / vpRows
-
-    if binSize > 0
-        volArray = array.new_float(vpRows, 0.0)
-        for k = 0 to vpLookbackBars - 1
-            bH = high[k]
-            bL = low[k]
-            bV = volume[k]
-            bRange = bH - bL
-            for i = 0 to vpRows - 1
-                binLow  = priceLow + i * binSize
-                binHigh = binLow + binSize
-                if bRange > 0
-                    ov = math.min(bH, binHigh) - math.max(bL, binLow)
-                    if ov > 0
-                        array.set(volArray, i, array.get(volArray, i) + bV * (ov / bRange))
-                else if bH >= binLow and bH <= binHigh
-                    array.set(volArray, i, array.get(volArray, i) + bV)
-
-        pocIdx = array.indexof(volArray, array.max(volArray))
-        maxVol = array.get(volArray, pocIdx)
-        totalVol = array.sum(volArray)
-
-        int   vaLowIdx   = pocIdx
-        int   vaHighIdx  = pocIdx
-        float accumulated = maxVol
-        targetVol = totalVol * vpValueAreaPct / 100
-        while accumulated < targetVol and (vaLowIdx > 0 or vaHighIdx < vpRows - 1)
-            canUp = vaHighIdx < vpRows - 1
-            canDown = vaLowIdx > 0
-            volAbove = canUp ? array.get(volArray, vaHighIdx + 1) : -1.0
-            volBelow = canDown ? array.get(volArray, vaLowIdx - 1) : -1.0
-            if canUp and (not canDown or volAbove >= volBelow)
-                vaHighIdx += 1
-                accumulated += volAbove
-            else
-                vaLowIdx -= 1
-                accumulated += volBelow
-
-        xLeft = bar_index + 1
-        for i = 0 to vpRows - 1
-            binLow  = priceLow + i * binSize
-            binHigh = binLow + binSize
-            vol = array.get(volArray, i)
-            w = maxVol > 0 ? math.round(vpWidthBars * vol / maxVol) : 0
-            inVA = i >= vaLowIdx and i <= vaHighIdx
-            barColor = i == pocIdx ? colPOC : (inVA ? colVPBarVA : colVPBar)
-            if w > 0
-                newBox = box.new(xLeft, binHigh, xLeft + int(w), binLow, color.new(color.black, 100), 1, line.style_solid, extend.none, xloc.bar_index, barColor)
-                array.push(vpBoxes, newBox)
-
-        pocPrice = priceLow + (pocIdx + 0.5) * binSize
-        vahPrice = priceLow + (vaHighIdx + 1) * binSize
-        valPrice = priceLow + vaLowIdx * binSize
-
-        vpPocLine := line.new(xLeft, pocPrice, xLeft + vpWidthBars, pocPrice, xloc.bar_index, extend.right, colPOC, line.style_solid, 2)
-        vpVahLine := line.new(xLeft, vahPrice, xLeft + vpWidthBars, vahPrice, xloc.bar_index, extend.right, colValueArea, line.style_dashed, 1)
-        vpValLine := line.new(xLeft, valPrice, xLeft + vpWidthBars, valPrice, xloc.bar_index, extend.right, colValueArea, line.style_dashed, 1)
-
-        vpPocLabel := label.new(xLeft + vpWidthBars, pocPrice, "POC", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_left, colPOC, size.tiny)
-        vpVahLabel := label.new(xLeft + vpWidthBars, vahPrice, "VAH", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_left, colValueArea, size.tiny)
-        vpValLabel := label.new(xLeft + vpWidthBars, valPrice, "VAL", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_left, colValueArea, size.tiny)
 
 // ============================================================================
 // BIAS DASHBOARD
