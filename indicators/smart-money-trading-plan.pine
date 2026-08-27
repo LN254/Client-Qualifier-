@@ -183,9 +183,18 @@ f_pruneZones(arr, maxSize) =>
             label.delete(old.infoLabel)
 
 // Builds a volume profile over the just-completed structural leg (legStartBar -> bar_index),
-// replacing whatever profile is currently drawn. POC/VAH/VAL lines then project forward with
-// extend.right so they read as support/resistance against later price action (e.g. a later FVG).
+// replacing whatever profile is currently drawn, and returns the new line/label IDs for the
+// caller to store — a function cannot reassign the script's global vars itself (CE10088),
+// only mutate objects (like the vpBoxes array) they already reference.
 f_buildVolumeProfile(legStartBar) =>
+    line  outPocLine  = na
+    line  outVahLine  = na
+    line  outValLine  = na
+    label outPocLabel = na
+    label outVahLabel = na
+    label outValLabel = na
+    built = false
+
     if not na(legStartBar)
         legLen = math.min(bar_index - legStartBar + 1, vpMaxLegBars)
         if legLen > 1
@@ -258,13 +267,16 @@ f_buildVolumeProfile(legStartBar) =>
                 vahPrice = priceLow + (vaHighIdx + 1) * binSize
                 valPrice = priceLow + vaLowIdx * binSize
 
-                vpPocLine := line.new(xLeft, pocPrice, bar_index, pocPrice, xloc.bar_index, extend.right, colPOC, line.style_solid, 2)
-                vpVahLine := line.new(xLeft, vahPrice, bar_index, vahPrice, xloc.bar_index, extend.right, colValueArea, line.style_dashed, 1)
-                vpValLine := line.new(xLeft, valPrice, bar_index, valPrice, xloc.bar_index, extend.right, colValueArea, line.style_dashed, 1)
+                outPocLine := line.new(xLeft, pocPrice, bar_index, pocPrice, xloc.bar_index, extend.right, colPOC, line.style_solid, 2)
+                outVahLine := line.new(xLeft, vahPrice, bar_index, vahPrice, xloc.bar_index, extend.right, colValueArea, line.style_dashed, 1)
+                outValLine := line.new(xLeft, valPrice, bar_index, valPrice, xloc.bar_index, extend.right, colValueArea, line.style_dashed, 1)
 
-                vpPocLabel := label.new(xLeft, pocPrice, "POC", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_right, colPOC, size.tiny)
-                vpVahLabel := label.new(xLeft, vahPrice, "VAH", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_right, colValueArea, size.tiny)
-                vpValLabel := label.new(xLeft, valPrice, "VAL", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_right, colValueArea, size.tiny)
+                outPocLabel := label.new(xLeft, pocPrice, "POC", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_right, colPOC, size.tiny)
+                outVahLabel := label.new(xLeft, vahPrice, "VAH", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_right, colValueArea, size.tiny)
+                outValLabel := label.new(xLeft, valPrice, "VAL", xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_right, colValueArea, size.tiny)
+                built := true
+
+    [outPocLine, outVahLine, outValLine, outPocLabel, outVahLabel, outValLabel, built]
 
 // ============================================================================
 // SECURITY (prior completed daily high/low - non-repainting)
@@ -420,7 +432,14 @@ if barstate.isconfirmed
         rangeHighBar := bar_index
         f_fireAlert("bos", 0, 0.0, 0.0)
         if showVolumeProfile
-            f_buildVolumeProfile(prevRangeLowBar)
+            [newPoc, newVah, newVal, newPocLbl, newVahLbl, newValLbl, vpBuilt] = f_buildVolumeProfile(prevRangeLowBar)
+            if vpBuilt
+                vpPocLine := newPoc
+                vpVahLine := newVah
+                vpValLine := newVal
+                vpPocLabel := newPocLbl
+                vpVahLabel := newVahLbl
+                vpValLabel := newValLbl
 
     else if not na(lastPL) and close < lastPL.price
         lastPL.broken := true
@@ -443,7 +462,14 @@ if barstate.isconfirmed
         rangeLowBar := bar_index
         f_fireAlert("bos", 0, 0.0, 0.0)
         if showVolumeProfile
-            f_buildVolumeProfile(prevRangeHighBar)
+            [newPoc, newVah, newVal, newPocLbl, newVahLbl, newValLbl, vpBuilt] = f_buildVolumeProfile(prevRangeHighBar)
+            if vpBuilt
+                vpPocLine := newPoc
+                vpVahLine := newVah
+                vpValLine := newVal
+                vpPocLabel := newPocLbl
+                vpVahLabel := newVahLbl
+                vpValLabel := newValLbl
 
     else
         if bias == "bullish" and not na(rangeHigh)
