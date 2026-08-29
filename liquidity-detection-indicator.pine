@@ -85,7 +85,7 @@ f_htfSwingData() =>
     [ph, pl, ot]
 
 [htfPH, htfPL, htfOriginTime] = request.security(syminfo.tickerid, htfTf, f_htfSwingData(),
-     lookahead = barmerge.lookahead_off, gaps = barmerge.gap_off)
+     lookahead = barmerge.lookahead_off)
 
 // =============================================================================
 // MINOR (LTF) STRUCTURE — feeds CHoCH confirmation after a sweep
