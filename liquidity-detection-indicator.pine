@@ -32,6 +32,13 @@ grpChoch = "CHoCH Confirmation"
 requireChoch = input.bool(false, "Require CHoCH Confirmation Before Alerting", group = grpChoch)
 chochWindow  = input.int(20, "CHoCH Confirmation Window (bars)", minval = 1, group = grpChoch)
 
+grpStruct = "Market Structure (BOS / CHoCH)"
+showStructure  = input.bool(true, "Show Standalone BOS/CHoCH Labels", group = grpStruct)
+showBosLabels  = input.bool(true, "Show BOS Labels (trend continuation)", group = grpStruct)
+chochBullColor = input.color(color.lime, "Bullish CHoCH Color", group = grpStruct)
+chochBearColor = input.color(color.red,  "Bearish CHoCH Color", group = grpStruct)
+bosColor       = input.color(color.gray, "BOS Label Color", group = grpStruct)
+
 grpVis = "Visuals"
 buyColor   = input.color(color.orange, "Buy-side Liquidity Color", group = grpVis)
 sellColor  = input.color(color.teal,   "Sell-side Liquidity Color", group = grpVis)
@@ -41,7 +48,7 @@ showTouchLabels = input.bool(true, "Show EQH/EQL Touch Count Labels", group = gr
 // =============================================================================
 // STATE — parallel arrays per side (buy-side = "bs", sell-side = "ss")
 // price / originTime / touchCount / swept / sweepBar / pierceBar / choch /
-// chochRef / line / touchLabel / sweepLabel / chochLabel
+// line / touchLabel / sweepLabel / chochLabel
 // =============================================================================
 var array<float> bsPrice     = array.new<float>()
 var array<int>   bsOriginT   = array.new<int>()
@@ -50,7 +57,6 @@ var array<bool>  bsSwept     = array.new<bool>()
 var array<int>   bsSweepBar  = array.new<int>()
 var array<int>   bsPierceBar = array.new<int>()
 var array<bool>  bsChoch     = array.new<bool>()
-var array<float> bsChochRef  = array.new<float>()
 var array<line>  bsLine      = array.new<line>()
 var array<label> bsTouchLbl  = array.new<label>()
 var array<label> bsSweepLbl  = array.new<label>()
@@ -63,7 +69,6 @@ var array<bool>  ssSwept     = array.new<bool>()
 var array<int>   ssSweepBar  = array.new<int>()
 var array<int>   ssPierceBar = array.new<int>()
 var array<bool>  ssChoch     = array.new<bool>()
-var array<float> ssChochRef  = array.new<float>()
 var array<line>  ssLine      = array.new<line>()
 var array<label> ssTouchLbl  = array.new<label>()
 var array<label> ssSweepLbl  = array.new<label>()
@@ -72,8 +77,12 @@ var array<label> ssChochLbl  = array.new<label>()
 var int lastHighProcessed = na
 var int lastLowProcessed  = na
 
-var float minorSwingHigh = na
-var float minorSwingLow  = na
+// Market structure state (trend + last unbroken swing points)
+var string structTrend      = ""
+var float  structSwingHigh  = na
+var float  structSwingLow   = na
+var bool   structHighBroken = false
+var bool   structLowBroken  = false
 
 // =============================================================================
 // HTF SWING PULL — dynamic-timeframe request.security (Pine v6, no lookahead)
@@ -88,14 +97,54 @@ f_htfSwingData() =>
      lookahead = barmerge.lookahead_off)
 
 // =============================================================================
-// MINOR (LTF) STRUCTURE — feeds CHoCH confirmation after a sweep
+// MARKET STRUCTURE — standalone BOS/CHoCH detector on minor (LTF) swings.
+// A break of the last unbroken swing point that FLIPS the tracked trend is a
+// CHoCH (change of character); a break that continues the trend is a BOS
+// (break of structure). This also feeds the post-sweep CHoCH confirmation
+// below, replacing the old "most recent pivot" snapshot with a real
+// last-unbroken-structural-point reference.
 // =============================================================================
 minorPH = ta.pivothigh(chochLen, chochLen)
 minorPL = ta.pivotlow(chochLen, chochLen)
 if not na(minorPH)
-    minorSwingHigh := minorPH
+    structSwingHigh := minorPH
+    structHighBroken := false
 if not na(minorPL)
-    minorSwingLow := minorPL
+    structSwingLow := minorPL
+    structLowBroken := false
+
+bool chochBullThisBar = false
+bool chochBearThisBar = false
+bool bosBullThisBar   = false
+bool bosBearThisBar   = false
+
+if not na(structSwingHigh) and not structHighBroken and close > structSwingHigh
+    structHighBroken := true
+    if structTrend == "bear"
+        chochBullThisBar := true
+    else
+        bosBullThisBar := true
+    structTrend := "bull"
+    if showStructure and (chochBullThisBar or showBosLabels)
+        label.new(bar_index, structSwingHigh,
+             chochBullThisBar ? "CHoCH" : "BOS", style = label.style_label_down,
+             color = color.new(chochBullThisBar ? chochBullColor : bosColor, chochBullThisBar ? 0 : 60),
+             textcolor = chochBullThisBar ? color.black : bosColor,
+             size = chochBullThisBar ? size.small : size.tiny)
+
+if not na(structSwingLow) and not structLowBroken and close < structSwingLow
+    structLowBroken := true
+    if structTrend == "bull"
+        chochBearThisBar := true
+    else
+        bosBearThisBar := true
+    structTrend := "bear"
+    if showStructure and (chochBearThisBar or showBosLabels)
+        label.new(bar_index, structSwingLow,
+             chochBearThisBar ? "CHoCH" : "BOS", style = label.style_label_up,
+             color = color.new(chochBearThisBar ? chochBearColor : bosColor, chochBearThisBar ? 0 : 60),
+             textcolor = chochBearThisBar ? color.white : bosColor,
+             size = chochBearThisBar ? size.small : size.tiny)
 
 // =============================================================================
 // HELPERS
@@ -147,7 +196,6 @@ if isNewHigh
         array.push(bsSweepBar, int(na))
         array.push(bsPierceBar, int(na))
         array.push(bsChoch, false)
-        array.push(bsChochRef, float(na))
         array.push(bsLine, newLine)
         array.push(bsTouchLbl, label(na))
         array.push(bsSweepLbl, label(na))
@@ -161,7 +209,6 @@ if isNewHigh
             array.shift(bsSweepBar)
             array.shift(bsPierceBar)
             array.shift(bsChoch)
-            array.shift(bsChochRef)
             oldTouchLbl = array.shift(bsTouchLbl)
             if not na(oldTouchLbl)
                 label.delete(oldTouchLbl)
@@ -209,7 +256,6 @@ if isNewLow
         array.push(ssSweepBar, int(na))
         array.push(ssPierceBar, int(na))
         array.push(ssChoch, false)
-        array.push(ssChochRef, float(na))
         array.push(ssLine, newLine)
         array.push(ssTouchLbl, label(na))
         array.push(ssSweepLbl, label(na))
@@ -223,7 +269,6 @@ if isNewLow
             array.shift(ssSweepBar)
             array.shift(ssPierceBar)
             array.shift(ssChoch)
-            array.shift(ssChochRef)
             oldTouchLbl2 = array.shift(ssTouchLbl)
             if not na(oldTouchLbl2)
                 label.delete(oldTouchLbl2)
@@ -256,7 +301,6 @@ if array.size(bsPrice) > 0
                     if close < lvlPrice
                         array.set(bsSwept, i, true)
                         array.set(bsSweepBar, i, bar_index)
-                        array.set(bsChochRef, i, minorSwingLow)
                         line.set_color(array.get(bsLine, i), sweptColor)
                         line.set_style(array.get(bsLine, i), line.style_solid)
                         line.set_x2(array.get(bsLine, i), time)
@@ -271,7 +315,6 @@ if array.size(bsPrice) > 0
                     if close < lvlPrice
                         array.set(bsSwept, i, true)
                         array.set(bsSweepBar, i, bar_index)
-                        array.set(bsChochRef, i, minorSwingLow)
                         line.set_color(array.get(bsLine, i), sweptColor)
                         line.set_style(array.get(bsLine, i), line.style_solid)
                         line.set_x2(array.get(bsLine, i), time)
@@ -285,8 +328,7 @@ if array.size(bsPrice) > 0
                         array.set(bsPierceBar, i, int(na))
         else
             if not array.get(bsChoch, i) and (bar_index - array.get(bsSweepBar, i) <= chochWindow)
-                ref = array.get(bsChochRef, i)
-                if not na(ref) and close < ref
+                if chochBearThisBar
                     array.set(bsChoch, i, true)
                     cLbl = label.new(bar_index, close, "CHoCH ▼", style = label.style_triangledown,
                          color = color.new(color.red, 20), textcolor = color.white, size = size.small)
@@ -308,7 +350,6 @@ if array.size(ssPrice) > 0
                     if close > lvlPrice2
                         array.set(ssSwept, i, true)
                         array.set(ssSweepBar, i, bar_index)
-                        array.set(ssChochRef, i, minorSwingHigh)
                         line.set_color(array.get(ssLine, i), sweptColor)
                         line.set_style(array.get(ssLine, i), line.style_solid)
                         line.set_x2(array.get(ssLine, i), time)
@@ -323,7 +364,6 @@ if array.size(ssPrice) > 0
                     if close > lvlPrice2
                         array.set(ssSwept, i, true)
                         array.set(ssSweepBar, i, bar_index)
-                        array.set(ssChochRef, i, minorSwingHigh)
                         line.set_color(array.get(ssLine, i), sweptColor)
                         line.set_style(array.get(ssLine, i), line.style_solid)
                         line.set_x2(array.get(ssLine, i), time)
@@ -337,8 +377,7 @@ if array.size(ssPrice) > 0
                         array.set(ssPierceBar, i, int(na))
         else
             if not array.get(ssChoch, i) and (bar_index - array.get(ssSweepBar, i) <= chochWindow)
-                ref2 = array.get(ssChochRef, i)
-                if not na(ref2) and close > ref2
+                if chochBullThisBar
                     array.set(ssChoch, i, true)
                     cLbl2 = label.new(bar_index, close, "CHoCH ▲", style = label.style_triangleup,
                          color = color.new(color.green, 20), textcolor = color.white, size = size.small)
