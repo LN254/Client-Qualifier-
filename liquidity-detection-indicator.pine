@@ -78,8 +78,13 @@ var float minorSwingLow  = na
 // =============================================================================
 // HTF SWING PULL — dynamic-timeframe request.security (Pine v6, no lookahead)
 // =============================================================================
-[htfPH, htfPL, htfOriginTime] = request.security(syminfo.tickerid, htfTf,
-     [ta.pivothigh(swingLeft, swingRight), ta.pivotlow(swingLeft, swingRight), time[swingRight]],
+f_htfSwingData() =>
+    ph = ta.pivothigh(swingLeft, swingRight)
+    pl = ta.pivotlow(swingLeft, swingRight)
+    ot = time[swingRight]
+    [ph, pl, ot]
+
+[htfPH, htfPL, htfOriginTime] = request.security(syminfo.tickerid, htfTf, f_htfSwingData(),
      lookahead = barmerge.lookahead_off, gaps = barmerge.gap_off)
 
 // =============================================================================
