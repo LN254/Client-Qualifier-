@@ -1,0 +1,395 @@
+//@version=6
+// =============================================================================
+// Liquidity Detection (SMC/ICT) — HTF-sourced buy/sell-side liquidity mapping
+// Counterpart to a Seiden supply/demand indicator; built for the same n8n
+// webhook alert pipeline (Agent Sam). Sources swing liquidity from a higher
+// timeframe (default 240 = 4H) while charting on a lower timeframe.
+// =============================================================================
+indicator("Liquidity Detection (SMC/ICT)", shorttitle = "LiqDetect", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+grpSwing = "Swing Detection"
+swingLeft  = input.int(5, "Swing Left Bars",  minval = 1, group = grpSwing)
+swingRight = input.int(5, "Swing Right Bars", minval = 1, group = grpSwing)
+chochLen   = input.int(3, "Minor Structure Lookback (CHoCH, bars)", minval = 1, group = grpSwing)
+
+grpHtf = "Higher Timeframe Source"
+htfTf = input.timeframe("240", "HTF Source Timeframe", group = grpHtf)
+
+grpEq = "Equal Highs / Lows"
+tolMode  = input.string("Ticks", "Tolerance Mode", options = ["Ticks", "Percent"], group = grpEq)
+tolValue = input.float(5.0, "Tolerance Value", minval = 0.0, group = grpEq)
+
+grpSweep = "Liquidity Sweep"
+sweepThreshTicks = input.int(3, "Sweep Wick Threshold (ticks)", minval = 0, group = grpSweep)
+maxLevels        = input.int(20, "Max Tracked Levels Per Side", minval = 1, maxval = 200, group = grpSweep)
+extendBars       = input.int(50, "Extend Lines Forward (bars)", minval = 1, group = grpSweep)
+
+grpChoch = "CHoCH Confirmation"
+requireChoch = input.bool(false, "Require CHoCH Confirmation Before Alerting", group = grpChoch)
+chochWindow  = input.int(20, "CHoCH Confirmation Window (bars)", minval = 1, group = grpChoch)
+
+grpStruct = "Market Structure (BOS / CHoCH)"
+showStructure  = input.bool(true, "Show Standalone BOS/CHoCH Labels", group = grpStruct)
+showBosLabels  = input.bool(true, "Show BOS Labels (trend continuation)", group = grpStruct)
+chochBullColor = input.color(color.lime, "Bullish CHoCH Color", group = grpStruct)
+chochBearColor = input.color(color.red,  "Bearish CHoCH Color", group = grpStruct)
+bosColor       = input.color(color.gray, "BOS Label Color", group = grpStruct)
+
+grpVis = "Visuals"
+buyColor   = input.color(color.orange, "Buy-side Liquidity Color", group = grpVis)
+sellColor  = input.color(color.teal,   "Sell-side Liquidity Color", group = grpVis)
+sweptColor = input.color(color.gray,   "Swept Level Color", group = grpVis)
+showTouchLabels = input.bool(true, "Show EQH/EQL Touch Count Labels", group = grpVis)
+
+// =============================================================================
+// STATE — parallel arrays per side (buy-side = "bs", sell-side = "ss")
+// price / originTime / touchCount / swept / sweepBar / pierceBar / choch /
+// line / touchLabel / sweepLabel / chochLabel
+// =============================================================================
+var array<float> bsPrice     = array.new<float>()
+var array<int>   bsOriginT   = array.new<int>()
+var array<int>   bsTouch     = array.new<int>()
+var array<bool>  bsSwept     = array.new<bool>()
+var array<int>   bsSweepBar  = array.new<int>()
+var array<int>   bsPierceBar = array.new<int>()
+var array<bool>  bsChoch     = array.new<bool>()
+var array<line>  bsLine      = array.new<line>()
+var array<label> bsTouchLbl  = array.new<label>()
+var array<label> bsSweepLbl  = array.new<label>()
+var array<label> bsChochLbl  = array.new<label>()
+
+var array<float> ssPrice     = array.new<float>()
+var array<int>   ssOriginT   = array.new<int>()
+var array<int>   ssTouch     = array.new<int>()
+var array<bool>  ssSwept     = array.new<bool>()
+var array<int>   ssSweepBar  = array.new<int>()
+var array<int>   ssPierceBar = array.new<int>()
+var array<bool>  ssChoch     = array.new<bool>()
+var array<line>  ssLine      = array.new<line>()
+var array<label> ssTouchLbl  = array.new<label>()
+var array<label> ssSweepLbl  = array.new<label>()
+var array<label> ssChochLbl  = array.new<label>()
+
+var int lastHighProcessed = na
+var int lastLowProcessed  = na
+
+// Market structure state (trend + last unbroken swing points)
+var string structTrend      = ""
+var float  structSwingHigh  = na
+var float  structSwingLow   = na
+var bool   structHighBroken = false
+var bool   structLowBroken  = false
+
+// =============================================================================
+// HTF SWING PULL — dynamic-timeframe request.security (Pine v6, no lookahead)
+// =============================================================================
+f_htfSwingData() =>
+    ph = ta.pivothigh(swingLeft, swingRight)
+    pl = ta.pivotlow(swingLeft, swingRight)
+    ot = time[swingRight]
+    [ph, pl, ot]
+
+[htfPH, htfPL, htfOriginTime] = request.security(syminfo.tickerid, htfTf, f_htfSwingData(),
+     lookahead = barmerge.lookahead_off)
+
+// =============================================================================
+// MARKET STRUCTURE — standalone BOS/CHoCH detector on minor (LTF) swings.
+// A break of the last unbroken swing point that FLIPS the tracked trend is a
+// CHoCH (change of character); a break that continues the trend is a BOS
+// (break of structure). This also feeds the post-sweep CHoCH confirmation
+// below, replacing the old "most recent pivot" snapshot with a real
+// last-unbroken-structural-point reference.
+// =============================================================================
+minorPH = ta.pivothigh(chochLen, chochLen)
+minorPL = ta.pivotlow(chochLen, chochLen)
+if not na(minorPH)
+    structSwingHigh := minorPH
+    structHighBroken := false
+if not na(minorPL)
+    structSwingLow := minorPL
+    structLowBroken := false
+
+bool chochBullThisBar = false
+bool chochBearThisBar = false
+bool bosBullThisBar   = false
+bool bosBearThisBar   = false
+
+if not na(structSwingHigh) and not structHighBroken and close > structSwingHigh
+    structHighBroken := true
+    if structTrend == "bear"
+        chochBullThisBar := true
+    else
+        bosBullThisBar := true
+    structTrend := "bull"
+    if showStructure and (chochBullThisBar or showBosLabels)
+        label.new(bar_index, structSwingHigh,
+             chochBullThisBar ? "CHoCH" : "BOS", style = label.style_label_down,
+             color = color.new(chochBullThisBar ? chochBullColor : bosColor, chochBullThisBar ? 0 : 60),
+             textcolor = chochBullThisBar ? color.black : bosColor,
+             size = chochBullThisBar ? size.small : size.tiny)
+
+if not na(structSwingLow) and not structLowBroken and close < structSwingLow
+    structLowBroken := true
+    if structTrend == "bull"
+        chochBearThisBar := true
+    else
+        bosBearThisBar := true
+    structTrend := "bear"
+    if showStructure and (chochBearThisBar or showBosLabels)
+        label.new(bar_index, structSwingLow,
+             chochBearThisBar ? "CHoCH" : "BOS", style = label.style_label_up,
+             color = color.new(chochBearThisBar ? chochBearColor : bosColor, chochBearThisBar ? 0 : 60),
+             textcolor = chochBearThisBar ? color.white : bosColor,
+             size = chochBearThisBar ? size.small : size.tiny)
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+extendMs = extendBars * timeframe.in_seconds() * 1000
+
+f_tolerance(refPrice) =>
+    tolMode == "Ticks" ? tolValue * syminfo.mintick : refPrice * tolValue / 100.0
+
+f_json(side, px, touchCount, confirmed) =>
+    '{"symbol": "' + syminfo.ticker + '", "timeframe": "' + timeframe.period + '", "side": "' + side +
+     '", "price": ' + str.tostring(px) + ', "touch_count": ' + str.tostring(touchCount) +
+     ', "confirmed": ' + (confirmed ? "true" : "false") + '}'
+
+// =============================================================================
+// PROCESS NEW HTF PIVOT HIGH -> BUY-SIDE LIQUIDITY (above price)
+// =============================================================================
+bool isNewHigh = not na(htfPH) and (na(lastHighProcessed) or htfOriginTime != lastHighProcessed)
+if isNewHigh
+    lastHighProcessed := htfOriginTime
+    tol = f_tolerance(htfPH)
+    int matchIdx = -1
+    if array.size(bsPrice) > 0
+        for i = 0 to array.size(bsPrice) - 1
+            if not array.get(bsSwept, i) and math.abs(array.get(bsPrice, i) - htfPH) <= tol
+                matchIdx := i
+                break
+    if matchIdx >= 0
+        newTouch = array.get(bsTouch, matchIdx) + 1
+        array.set(bsTouch, matchIdx, newTouch)
+        line.set_width(array.get(bsLine, matchIdx), 2)
+        if showTouchLabels
+            existingLbl = array.get(bsTouchLbl, matchIdx)
+            if na(existingLbl)
+                newLbl = label.new(bar_index, array.get(bsPrice, matchIdx), "×" + str.tostring(newTouch),
+                     style = label.style_label_down, color = color.new(buyColor, 80), textcolor = buyColor, size = size.tiny)
+                array.set(bsTouchLbl, matchIdx, newLbl)
+            else
+                label.set_text(existingLbl, "×" + str.tostring(newTouch))
+                label.set_x(existingLbl, bar_index)
+                label.set_y(existingLbl, array.get(bsPrice, matchIdx))
+    else
+        newLine = line.new(htfOriginTime, htfPH, htfOriginTime + extendMs, htfPH,
+             xloc = xloc.bar_time, extend = extend.none, color = buyColor, style = line.style_dashed, width = 1)
+        array.push(bsPrice, htfPH)
+        array.push(bsOriginT, htfOriginTime)
+        array.push(bsTouch, 1)
+        array.push(bsSwept, false)
+        array.push(bsSweepBar, int(na))
+        array.push(bsPierceBar, int(na))
+        array.push(bsChoch, false)
+        array.push(bsLine, newLine)
+        array.push(bsTouchLbl, label(na))
+        array.push(bsSweepLbl, label(na))
+        array.push(bsChochLbl, label(na))
+        if array.size(bsPrice) > maxLevels
+            line.delete(array.shift(bsLine))
+            array.shift(bsPrice)
+            array.shift(bsOriginT)
+            array.shift(bsTouch)
+            array.shift(bsSwept)
+            array.shift(bsSweepBar)
+            array.shift(bsPierceBar)
+            array.shift(bsChoch)
+            oldTouchLbl = array.shift(bsTouchLbl)
+            if not na(oldTouchLbl)
+                label.delete(oldTouchLbl)
+            oldSweepLbl = array.shift(bsSweepLbl)
+            if not na(oldSweepLbl)
+                label.delete(oldSweepLbl)
+            oldChochLbl = array.shift(bsChochLbl)
+            if not na(oldChochLbl)
+                label.delete(oldChochLbl)
+
+// =============================================================================
+// PROCESS NEW HTF PIVOT LOW -> SELL-SIDE LIQUIDITY (below price)
+// =============================================================================
+bool isNewLow = not na(htfPL) and (na(lastLowProcessed) or htfOriginTime != lastLowProcessed)
+if isNewLow
+    lastLowProcessed := htfOriginTime
+    tol = f_tolerance(htfPL)
+    int matchIdx = -1
+    if array.size(ssPrice) > 0
+        for i = 0 to array.size(ssPrice) - 1
+            if not array.get(ssSwept, i) and math.abs(array.get(ssPrice, i) - htfPL) <= tol
+                matchIdx := i
+                break
+    if matchIdx >= 0
+        newTouch = array.get(ssTouch, matchIdx) + 1
+        array.set(ssTouch, matchIdx, newTouch)
+        line.set_width(array.get(ssLine, matchIdx), 2)
+        if showTouchLabels
+            existingLbl = array.get(ssTouchLbl, matchIdx)
+            if na(existingLbl)
+                newLbl = label.new(bar_index, array.get(ssPrice, matchIdx), "×" + str.tostring(newTouch),
+                     style = label.style_label_up, color = color.new(sellColor, 80), textcolor = sellColor, size = size.tiny)
+                array.set(ssTouchLbl, matchIdx, newLbl)
+            else
+                label.set_text(existingLbl, "×" + str.tostring(newTouch))
+                label.set_x(existingLbl, bar_index)
+                label.set_y(existingLbl, array.get(ssPrice, matchIdx))
+    else
+        newLine = line.new(htfOriginTime, htfPL, htfOriginTime + extendMs, htfPL,
+             xloc = xloc.bar_time, extend = extend.none, color = sellColor, style = line.style_dashed, width = 1)
+        array.push(ssPrice, htfPL)
+        array.push(ssOriginT, htfOriginTime)
+        array.push(ssTouch, 1)
+        array.push(ssSwept, false)
+        array.push(ssSweepBar, int(na))
+        array.push(ssPierceBar, int(na))
+        array.push(ssChoch, false)
+        array.push(ssLine, newLine)
+        array.push(ssTouchLbl, label(na))
+        array.push(ssSweepLbl, label(na))
+        array.push(ssChochLbl, label(na))
+        if array.size(ssPrice) > maxLevels
+            line.delete(array.shift(ssLine))
+            array.shift(ssPrice)
+            array.shift(ssOriginT)
+            array.shift(ssTouch)
+            array.shift(ssSwept)
+            array.shift(ssSweepBar)
+            array.shift(ssPierceBar)
+            array.shift(ssChoch)
+            oldTouchLbl2 = array.shift(ssTouchLbl)
+            if not na(oldTouchLbl2)
+                label.delete(oldTouchLbl2)
+            oldSweepLbl2 = array.shift(ssSweepLbl)
+            if not na(oldSweepLbl2)
+                label.delete(oldSweepLbl2)
+            oldChochLbl2 = array.shift(ssChochLbl)
+            if not na(oldChochLbl2)
+                label.delete(oldChochLbl2)
+
+// =============================================================================
+// PER-BAR: extend active lines, detect sweeps, confirm CHoCH, fire alerts
+// =============================================================================
+threshPrice = sweepThreshTicks * syminfo.mintick
+
+bool sweepFiredThisBar = false
+bool chochFiredThisBar = false
+
+// ---- Buy-side (resistance above price) ----
+if array.size(bsPrice) > 0
+    for i = 0 to array.size(bsPrice) - 1
+        lvlPrice = array.get(bsPrice, i)
+        if not array.get(bsSwept, i)
+            line.set_x2(array.get(bsLine, i), time + extendMs)
+
+            pierceBar = array.get(bsPierceBar, i)
+            if na(pierceBar)
+                if high >= lvlPrice + threshPrice
+                    array.set(bsPierceBar, i, bar_index)
+                    if close < lvlPrice
+                        array.set(bsSwept, i, true)
+                        array.set(bsSweepBar, i, bar_index)
+                        line.set_color(array.get(bsLine, i), sweptColor)
+                        line.set_style(array.get(bsLine, i), line.style_solid)
+                        line.set_x2(array.get(bsLine, i), time)
+                        mLbl = label.new(bar_index, lvlPrice, "SWEEP", style = label.style_xcross,
+                             color = sweptColor, textcolor = sweptColor, size = size.tiny)
+                        array.set(bsSweepLbl, i, mLbl)
+                        sweepFiredThisBar := true
+                        if not requireChoch
+                            alert(f_json("buyside", lvlPrice, array.get(bsTouch, i), false), alert.freq_once_per_bar)
+            else
+                if bar_index > pierceBar
+                    if close < lvlPrice
+                        array.set(bsSwept, i, true)
+                        array.set(bsSweepBar, i, bar_index)
+                        line.set_color(array.get(bsLine, i), sweptColor)
+                        line.set_style(array.get(bsLine, i), line.style_solid)
+                        line.set_x2(array.get(bsLine, i), time)
+                        mLbl2 = label.new(bar_index, lvlPrice, "SWEEP", style = label.style_xcross,
+                             color = sweptColor, textcolor = sweptColor, size = size.tiny)
+                        array.set(bsSweepLbl, i, mLbl2)
+                        sweepFiredThisBar := true
+                        if not requireChoch
+                            alert(f_json("buyside", lvlPrice, array.get(bsTouch, i), false), alert.freq_once_per_bar)
+                    else
+                        array.set(bsPierceBar, i, int(na))
+        else
+            if not array.get(bsChoch, i) and (bar_index - array.get(bsSweepBar, i) <= chochWindow)
+                if chochBearThisBar
+                    array.set(bsChoch, i, true)
+                    cLbl = label.new(bar_index, close, "CHoCH ▼", style = label.style_triangledown,
+                         color = color.new(color.red, 20), textcolor = color.white, size = size.small)
+                    array.set(bsChochLbl, i, cLbl)
+                    chochFiredThisBar := true
+                    alert(f_json("buyside", lvlPrice, array.get(bsTouch, i), true), alert.freq_once_per_bar)
+
+// ---- Sell-side (support below price) ----
+if array.size(ssPrice) > 0
+    for i = 0 to array.size(ssPrice) - 1
+        lvlPrice2 = array.get(ssPrice, i)
+        if not array.get(ssSwept, i)
+            line.set_x2(array.get(ssLine, i), time + extendMs)
+
+            pierceBar2 = array.get(ssPierceBar, i)
+            if na(pierceBar2)
+                if low <= lvlPrice2 - threshPrice
+                    array.set(ssPierceBar, i, bar_index)
+                    if close > lvlPrice2
+                        array.set(ssSwept, i, true)
+                        array.set(ssSweepBar, i, bar_index)
+                        line.set_color(array.get(ssLine, i), sweptColor)
+                        line.set_style(array.get(ssLine, i), line.style_solid)
+                        line.set_x2(array.get(ssLine, i), time)
+                        mLbl3 = label.new(bar_index, lvlPrice2, "SWEEP", style = label.style_xcross,
+                             color = sweptColor, textcolor = sweptColor, size = size.tiny)
+                        array.set(ssSweepLbl, i, mLbl3)
+                        sweepFiredThisBar := true
+                        if not requireChoch
+                            alert(f_json("sellside", lvlPrice2, array.get(ssTouch, i), false), alert.freq_once_per_bar)
+            else
+                if bar_index > pierceBar2
+                    if close > lvlPrice2
+                        array.set(ssSwept, i, true)
+                        array.set(ssSweepBar, i, bar_index)
+                        line.set_color(array.get(ssLine, i), sweptColor)
+                        line.set_style(array.get(ssLine, i), line.style_solid)
+                        line.set_x2(array.get(ssLine, i), time)
+                        mLbl4 = label.new(bar_index, lvlPrice2, "SWEEP", style = label.style_xcross,
+                             color = sweptColor, textcolor = sweptColor, size = size.tiny)
+                        array.set(ssSweepLbl, i, mLbl4)
+                        sweepFiredThisBar := true
+                        if not requireChoch
+                            alert(f_json("sellside", lvlPrice2, array.get(ssTouch, i), false), alert.freq_once_per_bar)
+                    else
+                        array.set(ssPierceBar, i, int(na))
+        else
+            if not array.get(ssChoch, i) and (bar_index - array.get(ssSweepBar, i) <= chochWindow)
+                if chochBullThisBar
+                    array.set(ssChoch, i, true)
+                    cLbl2 = label.new(bar_index, close, "CHoCH ▲", style = label.style_triangleup,
+                         color = color.new(color.green, 20), textcolor = color.white, size = size.small)
+                    array.set(ssChochLbl, i, cLbl2)
+                    chochFiredThisBar := true
+                    alert(f_json("sellside", lvlPrice2, array.get(ssTouch, i), true), alert.freq_once_per_bar)
+
+// =============================================================================
+// ALERTS — TradingView alert dialog entries (dynamic JSON is sent via alert())
+// =============================================================================
+alertcondition(sweepFiredThisBar, title = "Liquidity Sweep Detected",
+     message = '{"symbol": "{{ticker}}", "timeframe": "{{interval}}", "event": "sweep"}')
+
+alertcondition(chochFiredThisBar, title = "Liquidity Sweep + CHoCH Confirmed",
+     message = '{"symbol": "{{ticker}}", "timeframe": "{{interval}}", "event": "choch_confirmed"}')
