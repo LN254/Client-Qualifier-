@@ -30,7 +30,12 @@ Validated instance: EURJPY, M15 — sweep 180.598 → CHoCH 180.976 → entry 18
 ## Loading in TradingView
 
 1. Open Pine Editor, paste `golden_setup_v1.pine`, add to chart.
-2. Inputs are grouped under Swing Points / Risk / Entry.
+2. Inputs are grouped under Swing Points / Risk / Entry / Direction / Display / Alerts:
+   - **Direction** — toggle bullish/bearish setup detection independently.
+   - **Display** — toggle each drawn level (CHoCH, BOS, SL, Entry, TP1, TP2)
+     on/off without affecting detection or alerts.
+   - **Alerts** — master on/off switch for the `alert()` webhook calls
+     (independent of the `minRR_TP1` suppression filter under Risk).
 3. Create two alerts on the indicator with condition **"Any alert() function
    call"** — one payload fires on entry-zone tag (`bos_confirmed: false`), a
    second fires on BOS close (`bos_confirmed: true`).
