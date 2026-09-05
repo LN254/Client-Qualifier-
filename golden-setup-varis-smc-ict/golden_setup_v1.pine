@@ -1,0 +1,236 @@
+//@version=6
+indicator("Golden Setup — Varis/SMC-ICT [golden_setup_v1]", shorttitle="GoldenSetup v1", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// Dynamic historical offsets are used below (order-block search loops), so Pine
+// can't statically size the lookback buffer for these series — declare it explicitly.
+max_bars_back(close, 500)
+max_bars_back(open, 500)
+max_bars_back(high, 500)
+max_bars_back(low, 500)
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+swingLeftBars  = input.int(5, "Swing Left Bars", minval=1, group="Swing Points")
+swingRightBars = input.int(5, "Swing Right Bars", minval=1, group="Swing Points")
+slBufferPips   = input.float(4.0, "SL Buffer (pips)", minval=0.0, group="Risk")
+minRR_TP1      = input.float(1.5, "Minimum RR to TP1 (suppress alert below)", minval=0.0, group="Risk")
+entryMode      = input.string("near_edge", "Entry Mode", options=["near_edge", "midpoint"], group="Entry")
+
+isJPY   = str.contains(syminfo.ticker, "JPY")
+pipSize = isJPY ? 0.01 : 0.0001
+slBuffer = slBufferPips * pipSize
+
+colChoch  = color.purple
+colBos    = color.black
+colSl     = color.green
+colEntry  = color.green
+colTp     = color.red
+
+// ---------------------------------------------------------------------------
+// Setup state (one bullish + one bearish machine, tracked independently)
+// ---------------------------------------------------------------------------
+type Setup
+    bool active = false
+    int sweepBar = na
+    float sweepPrice = na
+    int chochBar = na
+    float internalLevel = na   // CHoCH break level / TP1 candidate
+    float bosLevel = na        // major swing preceding the swept leg / BOS trigger
+    float tp2Level = na        // origin of the prior impulsive move
+    float obHigh = na
+    float obLow = na
+    float entryPrice = na
+    bool entryTagged = false
+    bool bosConfirmed = false
+    float sl = na
+    float tp1 = na
+    float tp2 = na
+    float rrTp1 = na
+    float rrTp2 = na
+
+var Setup longSetup  = Setup.new()
+var Setup shortSetup = Setup.new()
+
+// ---------------------------------------------------------------------------
+// Confirmed (closed-bar) swing pivots — no repainting
+// ---------------------------------------------------------------------------
+float ph = ta.pivothigh(high, swingLeftBars, swingRightBars)
+float pl = ta.pivotlow(low, swingLeftBars, swingRightBars)
+
+var array<float> swingHighPrices = array.new<float>()
+var array<float> swingLowPrices  = array.new<float>()
+
+int maxPivots = 50
+
+if not na(ph)
+    array.push(swingHighPrices, ph)
+    if array.size(swingHighPrices) > maxPivots
+        array.shift(swingHighPrices)
+
+if not na(pl)
+    array.push(swingLowPrices, pl)
+    if array.size(swingLowPrices) > maxPivots
+        array.shift(swingLowPrices)
+
+// ---------------------------------------------------------------------------
+// JSON payload builder
+// ---------------------------------------------------------------------------
+f_payload(dir, sweepP, chochP, entryP, slP, tp1P, tp2P, rr1, rr2, bosConf) =>
+    '{"pattern":"golden_setup_v1","symbol":"' + syminfo.ticker +
+     '","timeframe":"' + timeframe.period +
+     '","direction":"' + dir +
+     '","sweep_level":' + str.tostring(sweepP, format.mintick) +
+     ',"choch_level":' + str.tostring(chochP, format.mintick) +
+     ',"entry":' + str.tostring(entryP, format.mintick) +
+     ',"stop_loss":' + str.tostring(slP, format.mintick) +
+     ',"tp1":' + str.tostring(tp1P, format.mintick) +
+     ',"tp2":' + (na(tp2P) ? "null" : str.tostring(tp2P, format.mintick)) +
+     ',"rr_tp1":' + str.tostring(rr1, "#.##") +
+     ',"rr_tp2":' + (na(rr2) ? "null" : str.tostring(rr2, "#.##")) +
+     ',"bos_confirmed":' + (bosConf ? "true" : "false") +
+     ',"timestamp":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + '"}'
+
+// alertcondition() messages are compile-time-constant strings and can't carry a
+// runtime "direction" or live level substitution beyond {{plot}} numerics, so the
+// two required webhook payloads are fired with alert() instead (dynamic JSON).
+// Set the alert dialog's condition to "Any alert() function call".
+
+// ---------------------------------------------------------------------------
+// Bullish (long) machine
+// ---------------------------------------------------------------------------
+if longSetup.active and not longSetup.entryTagged and close < longSetup.sweepPrice
+    longSetup.active := false
+
+if not longSetup.active and array.size(swingLowPrices) > 0
+    float priorLow = array.get(swingLowPrices, array.size(swingLowPrices) - 1)
+    if low < priorLow and close > priorLow
+        longSetup := Setup.new()
+        longSetup.active := true
+        longSetup.sweepBar := bar_index
+        longSetup.sweepPrice := low
+        int nH = array.size(swingHighPrices)
+        if nH >= 1
+            longSetup.internalLevel := array.get(swingHighPrices, nH - 1)
+        if nH >= 2
+            longSetup.bosLevel := array.get(swingHighPrices, nH - 2)
+        if nH >= 3
+            longSetup.tp2Level := array.get(swingHighPrices, nH - 3)
+
+if longSetup.active and na(longSetup.chochBar) and not na(longSetup.internalLevel) and close > longSetup.internalLevel
+    longSetup.chochBar := bar_index
+    float obH = na
+    float obL = na
+    int maxOff = bar_index - longSetup.sweepBar
+    for j = 1 to maxOff
+        if na(obH) and close[j] < open[j]
+            obH := high[j]
+            obL := low[j]
+    longSetup.obHigh := obH
+    longSetup.obLow := obL
+    if not na(obH)
+        longSetup.entryPrice := entryMode == "near_edge" ? obH : (obH + longSetup.sweepPrice) / 2.0
+        line.new(longSetup.sweepBar, longSetup.internalLevel, bar_index, longSetup.internalLevel, color=colChoch, width=2, extend=extend.right)
+        label.new(bar_index, longSetup.internalLevel, "CHoCH", color=colChoch, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+if longSetup.active and not na(longSetup.chochBar) and not longSetup.entryTagged and not na(longSetup.entryPrice) and high >= longSetup.entryPrice and low <= longSetup.entryPrice
+    longSetup.entryTagged := true
+    longSetup.sl := longSetup.sweepPrice - slBuffer
+    longSetup.tp1 := longSetup.internalLevel
+    longSetup.tp2 := longSetup.tp2Level
+    longSetup.rrTp1 := (longSetup.tp1 - longSetup.entryPrice) / (longSetup.entryPrice - longSetup.sl)
+    longSetup.rrTp2 := na(longSetup.tp2) ? na : (longSetup.tp2 - longSetup.entryPrice) / (longSetup.entryPrice - longSetup.sl)
+
+    line.new(bar_index, longSetup.entryPrice, bar_index + 10, longSetup.entryPrice, color=colEntry, width=1, extend=extend.right)
+    label.new(bar_index, longSetup.entryPrice, "Entry", color=colEntry, textcolor=color.white, style=label.style_label_up, size=size.small)
+    line.new(bar_index, longSetup.sl, bar_index + 10, longSetup.sl, color=colSl, width=1, extend=extend.right)
+    label.new(bar_index, longSetup.sl, "SL", color=colSl, textcolor=color.white, style=label.style_label_down, size=size.small)
+    line.new(bar_index, longSetup.tp1, bar_index + 10, longSetup.tp1, color=colTp, width=1, extend=extend.right)
+    label.new(bar_index, longSetup.tp1, "TP1", color=colTp, textcolor=color.white, style=label.style_label_up, size=size.small)
+    if not na(longSetup.tp2)
+        line.new(bar_index, longSetup.tp2, bar_index + 10, longSetup.tp2, color=colTp, width=1, extend=extend.right)
+        label.new(bar_index, longSetup.tp2, "TP2", color=colTp, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+    if longSetup.rrTp1 >= minRR_TP1
+        alert(f_payload("long", longSetup.sweepPrice, longSetup.internalLevel, longSetup.entryPrice, longSetup.sl, longSetup.tp1, longSetup.tp2, longSetup.rrTp1, longSetup.rrTp2, false), alert.freq_once_per_bar_close)
+
+if longSetup.active and longSetup.entryTagged and not longSetup.bosConfirmed and not na(longSetup.bosLevel) and close > longSetup.bosLevel
+    longSetup.bosConfirmed := true
+    line.new(longSetup.chochBar, longSetup.bosLevel, bar_index, longSetup.bosLevel, color=colBos, width=2, extend=extend.right)
+    label.new(bar_index, longSetup.bosLevel, "BOS", color=colBos, textcolor=color.white, style=label.style_label_down, size=size.small)
+    if longSetup.rrTp1 >= minRR_TP1
+        alert(f_payload("long", longSetup.sweepPrice, longSetup.internalLevel, longSetup.entryPrice, longSetup.sl, longSetup.tp1, longSetup.tp2, longSetup.rrTp1, longSetup.rrTp2, true), alert.freq_once_per_bar_close)
+    longSetup.active := false
+
+// bail out of a setup that never tags entry so a new sweep can be detected
+if longSetup.active and not longSetup.entryTagged and (bar_index - longSetup.sweepBar) > 500
+    longSetup.active := false
+
+// ---------------------------------------------------------------------------
+// Bearish (short) machine — mirror of the above
+// ---------------------------------------------------------------------------
+if shortSetup.active and not shortSetup.entryTagged and close > shortSetup.sweepPrice
+    shortSetup.active := false
+
+if not shortSetup.active and array.size(swingHighPrices) > 0
+    float priorHigh = array.get(swingHighPrices, array.size(swingHighPrices) - 1)
+    if high > priorHigh and close < priorHigh
+        shortSetup := Setup.new()
+        shortSetup.active := true
+        shortSetup.sweepBar := bar_index
+        shortSetup.sweepPrice := high
+        int nL = array.size(swingLowPrices)
+        if nL >= 1
+            shortSetup.internalLevel := array.get(swingLowPrices, nL - 1)
+        if nL >= 2
+            shortSetup.bosLevel := array.get(swingLowPrices, nL - 2)
+        if nL >= 3
+            shortSetup.tp2Level := array.get(swingLowPrices, nL - 3)
+
+if shortSetup.active and na(shortSetup.chochBar) and not na(shortSetup.internalLevel) and close < shortSetup.internalLevel
+    shortSetup.chochBar := bar_index
+    float obH = na
+    float obL = na
+    int maxOff = bar_index - shortSetup.sweepBar
+    for j = 1 to maxOff
+        if na(obL) and close[j] > open[j]
+            obH := high[j]
+            obL := low[j]
+    shortSetup.obHigh := obH
+    shortSetup.obLow := obL
+    if not na(obL)
+        shortSetup.entryPrice := entryMode == "near_edge" ? obL : (obL + shortSetup.sweepPrice) / 2.0
+        line.new(shortSetup.sweepBar, shortSetup.internalLevel, bar_index, shortSetup.internalLevel, color=colChoch, width=2, extend=extend.right)
+        label.new(bar_index, shortSetup.internalLevel, "CHoCH", color=colChoch, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+if shortSetup.active and not na(shortSetup.chochBar) and not shortSetup.entryTagged and not na(shortSetup.entryPrice) and high >= shortSetup.entryPrice and low <= shortSetup.entryPrice
+    shortSetup.entryTagged := true
+    shortSetup.sl := shortSetup.sweepPrice + slBuffer
+    shortSetup.tp1 := shortSetup.internalLevel
+    shortSetup.tp2 := shortSetup.tp2Level
+    shortSetup.rrTp1 := (shortSetup.entryPrice - shortSetup.tp1) / (shortSetup.sl - shortSetup.entryPrice)
+    shortSetup.rrTp2 := na(shortSetup.tp2) ? na : (shortSetup.entryPrice - shortSetup.tp2) / (shortSetup.sl - shortSetup.entryPrice)
+
+    line.new(bar_index, shortSetup.entryPrice, bar_index + 10, shortSetup.entryPrice, color=colEntry, width=1, extend=extend.right)
+    label.new(bar_index, shortSetup.entryPrice, "Entry", color=colEntry, textcolor=color.white, style=label.style_label_down, size=size.small)
+    line.new(bar_index, shortSetup.sl, bar_index + 10, shortSetup.sl, color=colSl, width=1, extend=extend.right)
+    label.new(bar_index, shortSetup.sl, "SL", color=colSl, textcolor=color.white, style=label.style_label_up, size=size.small)
+    line.new(bar_index, shortSetup.tp1, bar_index + 10, shortSetup.tp1, color=colTp, width=1, extend=extend.right)
+    label.new(bar_index, shortSetup.tp1, "TP1", color=colTp, textcolor=color.white, style=label.style_label_down, size=size.small)
+    if not na(shortSetup.tp2)
+        line.new(bar_index, shortSetup.tp2, bar_index + 10, shortSetup.tp2, color=colTp, width=1, extend=extend.right)
+        label.new(bar_index, shortSetup.tp2, "TP2", color=colTp, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+    if shortSetup.rrTp1 >= minRR_TP1
+        alert(f_payload("short", shortSetup.sweepPrice, shortSetup.internalLevel, shortSetup.entryPrice, shortSetup.sl, shortSetup.tp1, shortSetup.tp2, shortSetup.rrTp1, shortSetup.rrTp2, false), alert.freq_once_per_bar_close)
+
+if shortSetup.active and shortSetup.entryTagged and not shortSetup.bosConfirmed and not na(shortSetup.bosLevel) and close < shortSetup.bosLevel
+    shortSetup.bosConfirmed := true
+    line.new(shortSetup.chochBar, shortSetup.bosLevel, bar_index, shortSetup.bosLevel, color=colBos, width=2, extend=extend.right)
+    label.new(bar_index, shortSetup.bosLevel, "BOS", color=colBos, textcolor=color.white, style=label.style_label_up, size=size.small)
+    if shortSetup.rrTp1 >= minRR_TP1
+        alert(f_payload("short", shortSetup.sweepPrice, shortSetup.internalLevel, shortSetup.entryPrice, shortSetup.sl, shortSetup.tp1, shortSetup.tp2, shortSetup.rrTp1, shortSetup.rrTp2, true), alert.freq_once_per_bar_close)
+    shortSetup.active := false
+
+if shortSetup.active and not shortSetup.entryTagged and (bar_index - shortSetup.sweepBar) > 500
+    shortSetup.active := false
